@@ -2,7 +2,7 @@
 
 # Scaling Density Functional Theory with Gaussian Splatting
 
-**Andrés Guzmán-Cordero**<sup>1,2</sup> · **Majdi Hassan**<sup>1,2</sup> · **Marta Skreta**<sup>1,2</sup> · **Cindy Zhang**<sup>3</sup> · **Kirill Neklyudov**<sup>1,2,5,†</sup> · **Matija Medvidović**<sup>4,†</sup>
+**Andrés Guzmán-Cordero**<sup>1,2</sup> · **Cindy Zhang**<sup>3</sup> · **Majdi Hassan**<sup>1,2</sup> · **Marta Skreta**<sup>1,2</sup> · **Kirill Neklyudov**<sup>1,2,5,†</sup> · **Matija Medvidović**<sup>4,†</sup>
 
 <sup>1</sup>Mila – Quebec AI Institute · <sup>2</sup>Université de Montréal · <sup>3</sup>Princeton University · <sup>4</sup>ETH Zurich · <sup>5</sup>Institut Courtois · <sup>†</sup>Equal supervision
 
@@ -143,7 +143,7 @@ metadata, and GitHub's "Cite this repository" reads it.
 ```bibtex
 @article{guzmancordero2027gsdft,
   title   = {Scaling Density Functional Theory with Gaussian Splatting},
-  author  = {Guzm\'an-Cordero, Andr\'es and Hassan, Majdi and Skreta, Marta and Zhang, Cindy and
+  author  = {Guzm\'an-Cordero, Andr\'es and Zhang, Cindy and Hassan, Majdi and Skreta, Marta and
              Neklyudov, Kirill and Medvidovi\'c, Matija},
   journal = {arXiv preprint arXiv:XXXX.XXXXX},
   eprint  = {XXXX.XXXXX},
