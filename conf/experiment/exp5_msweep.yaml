@@ -1,0 +1,18 @@
+# @package _global_
+# A splat M-sweep at a chosen Coulomb path and functional, also used for the ionization potentials.
+#   coulomb=exact xc=pbe · coulomb=df xc=pbe · coulomb=df xc=pbe0|b3lyp
+system: co2                   # co2 | ethanol
+m: null                       # required
+coulomb: df                   # df | exact
+steps: 2000
+seed: 0
+grid_level: 3
+monitor: 200
+
+ckpt_every: 20
+resume: true                  # a re-run continues from the checkpoint
+
+grid_check: 5
+
+koopmans: false               # report eps_HOMO; under HF, -eps_HOMO is the ionization potential
+skip_ref: false               # skip the Gaussian reference (no E_ref, gap_mha or beats)

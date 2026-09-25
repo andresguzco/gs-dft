@@ -1,0 +1,11 @@
+# @package _global_
+# One rung of the representation ladder of Figure 2(a). Each rung adds one ingredient to the one
+# before it, and every rung runs at identical settings.
+rung: L4                      # L0 Frost FSGO · L1 +coefficients · L2 +overcomplete
+                              # L3 +axis-aligned anisotropy (ellipsoidal FSGO) · L4 +orientation (GS-DFT)
+system: water
+xc: pbe
+grid_level: 3
+grid_check: 5
+steps: 6000
+m_mult: 2.0                   # used by the overcomplete rungs (L2+); L0/L1 use M = n_occ

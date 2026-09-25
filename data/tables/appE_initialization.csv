@@ -1,0 +1,6 @@
+scheme,adds,water_M48_E_ha,water_spread_mha,ethanol_M144_E_ha,ethanol_spread_mha
+S0,"random, atom-centered",-76.30164,11.7,-154.87106,4.6
+S1,element exponent ranges,-76.32034,1.3,-154.89223,1.9
+S2,bond-centered splats,-76.32044,1.3,-154.89412,6.0
+S3,bond-aligned anisotropy,-76.32078,2.3,-154.89656,1.7
+S4,charge-proportional allocation,-76.32853,2.1,-154.90574,0.1

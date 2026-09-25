@@ -1,0 +1,7 @@
+# @package _global_
+# One Gaussian cc-pVXZ reference per process, on the same engine, functional and grid as the splat
+# runs, so the difference from the complete-basis limit is the basis alone.
+system: h2o
+basis: cc-pvqz
+mode: conv                    # conv: exact in-core ERIs · df: RI-JK (def2-universal-jkfit), for the
+                              # systems where exact ERIs do not fit in memory

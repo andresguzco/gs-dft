@@ -1,0 +1,12 @@
+# @package _global_
+# End-to-end time and memory for one configuration, splat or Gaussian, on the same engine and grid.
+system: water                 # co2 | water | ethanol | alanine_dipeptide
+engine: splat                 # splat | gto
+m: null                       # splat count (engine=splat)
+basis: cc-pvdz                # Gaussian basis (engine=gto)
+seed: 0
+
+steps: 12000
+grid_level: 3                 # shared by both engines
+
+grid_check: 5

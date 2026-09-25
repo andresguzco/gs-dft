@@ -1,0 +1,18 @@
+# @package _global_
+# One splat run at (system, M), used for the functional coverage of Table 1.
+system: water
+m: null                       # required
+seed: 0
+
+steps: 6000
+refresh: 50
+
+grid_level: 3
+grid_check: 5
+
+monitor: 500
+partial_every: 1000
+
+ckpt_every: 1000              # 0 disables
+resume: true                  # continue from a checkpoint of this exact run (system, M, xc, steps, seed)
+ckpt_dir: null                # null => do not save the trained model

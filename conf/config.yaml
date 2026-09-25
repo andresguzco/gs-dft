@@ -1,0 +1,44 @@
+# Shared defaults for every experiment runner. An experiment overrides a key in its own
+# conf/experiment/<name>.yaml only where it differs; select one with `experiment=<name>` (not
+# `+experiment=`, since the group is already in the defaults list). Every run writes its resolved
+# config to the Hydra output directory.
+
+defaults:
+  - _self_
+  - experiment: null
+
+# --- system -----------------------------------------------------------------
+system: water                 # geometry key (see experiments/common/systems.py)
+basis: cc-pvdz                # reference basis
+xc: pbe                       # pbe | pbe0 | b3lyp | r2scan, resolved by experiments.common.builders.xc_of
+
+# --- basis size -------------------------------------------------------------
+m: null                       # absolute splat count; null => m_mult * nao
+m_mult: 2.0
+
+# --- optimization -----------------------------------------------------------
+steps: 6000
+seed: 0
+refresh: 10                   # steps between rebuilds of the pair list and the frozen auxiliary basis
+
+# --- density fitting --------------------------------------------------------
+df_lam: 1e-8                  # Tikhonov regularization of the auxiliary metric solve
+gamma_chunk: 512              # pairs per step of the RI-J stream; peak memory is linear in it and the
+                              # energy does not depend on it
+aux_mult: 1                   # auxiliary basis size, naux = aux_mult * M (builders.AUX_LADDER: 1|2|3|5)
+
+# --- quadrature -------------------------------------------------------------
+grid_level: 3
+grid_check: 0                 # re-evaluate the final energy on this grid level (0 = off)
+
+# --- reporting --------------------------------------------------------------
+monitor: 500                  # progress cadence, steps
+partial_every: 1000           # RESULT_PARTIAL cadence, steps
+
+# --- tracking (Weights & Biases) --------------------------------------------
+wandb_mode: disabled          # disabled | offline | online
+wandb_project: null           # null => one project per experiment directory
+
+hydra:
+  job:
+    chdir: false              # runners resolve paths from __file__ and print RESULT lines to stdout

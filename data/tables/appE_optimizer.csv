@@ -1,0 +1,20 @@
+optimizer,family,delta_vs_adam_mha
+Adamax,Adam,-13.7
+AdaBelief,Adam,-9.5
+RAdam,Adam,-9.4
+LAMB,trust ratio,-8.3
+AdamW,weight decay,-4.2
+Adam,Adam,0.0
+NAdam,Adam,+5.4
+Yogi,Adam,+75.0
+RMSProp,second moment,+88.9
+AMSGrad,Adam,+94.4
+Novograd,Adam,+228.6
+AdaGrad,second moment,+302.2
+signSGD,sign,+321.3
+SGD,non-adaptive,+449.3
+LARS,trust ratio,+847.2
+Fromage,trust ratio,+998.8
+AdaDelta,second moment,+1043.4
+Lion,sign,diverged
+Adan,Adam,diverged

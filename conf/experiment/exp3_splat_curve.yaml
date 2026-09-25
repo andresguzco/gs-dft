@@ -1,0 +1,11 @@
+# @package _global_
+# One cold-start splat point (R, M) on the dissociation curve.
+system: lih                   # lih | lif
+r: 1.6                        # bond length, angstrom
+m: null                       # required
+seed: 0
+
+steps: 4000
+grid_level: 3                 # matches the Gaussian curve
+
+grid_check: 5

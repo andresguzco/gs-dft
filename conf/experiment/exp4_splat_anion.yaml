@@ -1,0 +1,10 @@
+# @package _global_
+# One splat run on a bare anion at fixed M.
+system: f_anion               # f_anion | oh_anion
+m: null                       # required
+seed: 0
+
+steps: 12000
+monitor: 500
+grid_level: 3
+grid_check: 5                 # the reported energy is the level-5 re-evaluation

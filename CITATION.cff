@@ -1,0 +1,61 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software and the paper."
+title: "gs-dft: Scaling Density Functional Theory with Gaussian Splatting"
+abstract: >-
+  Kohn-Sham DFT in a trainable basis of floating anisotropic Gaussians, optimized
+  jointly with the orbitals by gradient descent, with adaptive density fitting,
+  screening and multi-GPU sharding, in JAX.
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/andresguzco/gs-dft"
+keywords:
+  - density functional theory
+  - Gaussian splatting
+  - quantum chemistry
+  - JAX
+authors:
+  - family-names: "Guzmán-Cordero"
+    given-names: "Andrés"
+    affiliation: "Mila - Quebec AI Institute; Université de Montréal"
+    email: "andres.guzman-cordero@mila.quebec"
+  - family-names: "Hassan"
+    given-names: "Majdi"
+    affiliation: "Mila - Quebec AI Institute; Université de Montréal"
+  - family-names: "Skreta"
+    given-names: "Marta"
+    affiliation: "Mila - Quebec AI Institute; Université de Montréal"
+  - family-names: "Zhang"
+    given-names: "Cindy"
+    affiliation: "Princeton University"
+  - family-names: "Neklyudov"
+    given-names: "Kirill"
+    affiliation: "Mila - Quebec AI Institute; Université de Montréal; Institut Courtois"
+  - family-names: "Medvidović"
+    given-names: "Matija"
+    affiliation: "ETH Zurich"
+
+preferred-citation:
+  type: article
+  title: "Scaling Density Functional Theory with Gaussian Splatting"
+  authors:
+    - family-names: "Guzmán-Cordero"
+      given-names: "Andrés"
+    - family-names: "Hassan"
+      given-names: "Majdi"
+    - family-names: "Skreta"
+      given-names: "Marta"
+    - family-names: "Zhang"
+      given-names: "Cindy"
+    - family-names: "Neklyudov"
+      given-names: "Kirill"
+    - family-names: "Medvidović"
+      given-names: "Matija"
+  year: 2027
+
+# The FMODB structures and their published FMO energies are CC BY-SA 4.0; this repository stores
+# only their IDs (see experiments/common/fmodb.py).
+references:
+  - type: database
+    title: "FMODB: the FMO Drug Design Consortium database"
+    url: "https://drugdesign.riken.jp/FMODB/"
+    notes: "CC BY-SA 4.0. Takaya et al., J. Chem. Inf. Model. 2021, 61, 777."

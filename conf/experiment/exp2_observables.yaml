@@ -1,0 +1,9 @@
+# @package _global_
+# Splat observables of Figure 3 from a trained checkpoint, compared against the Gaussian ladder.
+system: water                 # water | ethanol | alanine_dipeptide
+
+grid_check: 5                 # the reported energy is the level-5 re-evaluation
+
+obs_grid_level: 5
+
+m: null

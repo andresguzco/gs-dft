@@ -1,0 +1,6 @@
+code,gpu,multi_gpu,differentiable,density_fitting,forces,relevant_bases,largest_system_atoms_cc-pvtz,note
+GS-DFT,yes,yes,yes,yes,yes,yes,2742,
+D4FT,yes,no,yes,no,no,yes,9,
+MESS,yes,no,yes,no,no,no,,
+DQC,no,no,yes,yes,yes,yes,9,GPU path fails while building the molecule
+PySCF,no,no,no,yes,yes,yes,153,"set by wall-clock time on the CPU, not by memory"

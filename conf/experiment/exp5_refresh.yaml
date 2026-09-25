@@ -1,0 +1,17 @@
+# @package _global_
+# The Figure 5 runs: 12,000 steps over seeds 0, 1 and 2 at every point of the M ladder.
+system: water                 # water | ethanol | alanine_dipeptide
+m: null                       # required
+seed: 0
+
+steps: 12000
+refresh: 50
+
+grid_level: 3
+grid_check: 5
+
+monitor: 500
+partial_every: 1000
+ckpt_every: 1000
+resume: true                  # a re-run continues from the checkpoint
+ckpt_dir: null

@@ -1,0 +1,6 @@
+system,fmodb_id,atoms,M,peak_mem_gsdft_gb,peak_mem_gto_gb_extrapolated,E_gsdft_ha,E_fmo2_hf_ha,fits_node_gsdft,fits_node_gto,forces_gsdft,forces_gto
+Trp-cage,PJM49,304,6720,25.2,640,-7478.3,-7439.0,yes,no,yes,no
+Defensin,9LQN2,465,10390,39.6,1060,-13685.4,-13624.0,yes,no,yes,no
+Insulin,LG5K9,947,21026,92.8,2400,-25523.2,-25404.2,yes,no,yes,no
+beta-spectrin CH,38KNL,1755,38794,212.0,4850,-44255.4,-44045.7,yes,no,yes,no
+3IFU (chain A),25J8R,2742,60308,479.6,8070,-69823.2,-69631.4,yes,no,yes,no

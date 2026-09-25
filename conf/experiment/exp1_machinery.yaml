@@ -1,0 +1,16 @@
+# @package _global_
+# One rung of the machinery ladder of Figure 2(b, c) and the eigensolve ablation of Appendix E.
+# Each rung adds one piece: M0 exact · M1 +DF · M2 +regularized eigensolve · M3 +screening ·
+# M4 +chunking · M5 +sharding. M0 and M1 run without the regularized eigensolve.
+rung: M2
+system: ethanol
+xc: pbe
+grid_level: 3
+grid_check: 0
+steps: 2000
+m_mult: 2.0
+
+screen_pad: 2.0
+screen_eps: 1.0e-7            # pair-screening threshold tau
+
+init: chem

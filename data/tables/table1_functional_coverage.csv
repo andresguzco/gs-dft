@@ -1,0 +1,5 @@
+functional,delta_cbs_gsdft_mha,delta_cbs_cc-pvtz_mha,percent_m
+PBE,2.3,22.8,<29
+B3LYP,16.9,21.3,77
+r2SCAN,1.8,19.9,<29
+wB97M-V,10.2,19.8,61

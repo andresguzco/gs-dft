@@ -1,0 +1,32 @@
+# @package _global_
+# Forces from a converged size-ladder checkpoint. The settings match exp7_train.yaml because a
+# checkpoint only loads under the configuration that wrote it. Override `tag` to pick the checkpoint.
+system: alanine_dipeptide
+
+init_c: random
+m_mult: 1.0
+grid_level: 2
+
+steps: 1500
+seed: 0
+
+warmup: 0
+polish_lr: 0.0                # set to the constant lr the checkpoint finished under, if any
+
+monitor: 25
+grid_check: 4
+cond_every: 0
+collapse: true
+
+ckpt: null
+ckpt_every: 50
+resume: true
+
+out_dir: null
+tag: null
+
+grid_chunk: 4096
+remat: false
+
+theta_grad: true              # also report ||dE/dtheta||. Needs the full energy backward, so set it
+                              # false past about M = 30,000 and read grad_norm from the training JSONL

@@ -1,0 +1,15 @@
+# @package _global_
+# The optimizer comparison of Appendix E: one run per Optax optimizer, each with its own learning rate.
+opt: adam                     # a key of experiments/exp1_ablation_ladder/optimizers.py:ARMS, or lbfgs
+
+system: alanine_dipeptide
+basis: cc-pvtz                # M = nao(cc-pVTZ) = 468
+m_mult: 1.0
+xc: pbe
+grid_level: 3
+grid_check: 0
+
+steps: 12000
+seed: 0
+
+screen_pad: 2.0

@@ -1,0 +1,16 @@
+# @package _global_
+# One warm-started splat chain along the dissociation curve at fixed M. The first R starts cold;
+# every later R starts from the previous converged cloud, shifted with its atom, at a reduced lr.
+system: lih                   # lih | lif; also selects the R grid
+m: null                       # required
+seed: 0                       # seeds the cold start
+
+cold_steps: 4000              # first R, at lr 1e-2
+warm_steps: 2000              # every later R
+warm_lr: 5e-3
+grid_level: 3
+
+grid_check: 5
+
+
+r_grid: null

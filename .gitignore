@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.benchmarks/
+.jax_cache/
+.ipynb_checkpoints/
+.DS_Store
+.claude/
+
+# Run outputs: logs, checkpoints and references stay out of git. The figures and tables are built
+# from the CSV files in data/.
+experiments/*/results*/
+outputs/
+wandb/
+*.out
+*.step
+*.eqx
+*.ckpt
+*.pkl
+*.pt
+*.npy
+*.npz
+
+# XLA compiler dumps
+xla_dump*/
+*.hlo
+*.ll
+*.ptx
+*.mlir
+
+# FMODB structures are CC BY-SA 4.0 and are fetched, not committed.
+experiments/common/fmodb_cache/
+experiments/common/geometry/*.xyz
+!experiments/common/geometry/penicillin.xyz
+
+# Generated figures: rebuild them with `make figures`.
+experiments/**/*.png
+experiments/**/*.pdf
+!experiments/shared/visual_abstract.png
+
+# The paper lives in its own repository.
+paper/

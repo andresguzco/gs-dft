@@ -1,0 +1,12 @@
+# @package _global_
+# Gaussian reference observables for Figure 3 at one (system, basis), on the same functional, grid
+# and auxiliary basis as the splat side.
+system: water                 # water | ethanol | alanine_dipeptide
+basis: cc-pvdz                # the ladder runs cc-pVDZ to cc-pV5Z
+grid_level: 3                 # the density grid is shared by every rung and by the splat side
+
+obs_grid_level: 5
+
+force_max_nao: 200
+
+corr: ccsd_t                  # ccsd_t | mp2; mp2 writes mp2_*.npz instead of cc_*.npz

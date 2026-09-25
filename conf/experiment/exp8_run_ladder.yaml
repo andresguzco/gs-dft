@@ -1,0 +1,16 @@
+# @package _global_
+# The initialization ablation of Appendix E: schemes S0 to S4 over seeds, in one process.
+system: water
+m_mult: 2.0
+grid_level: 3
+steps: 4000
+refresh: 50
+monitor: 1000
+partial_every: 250
+
+schemes: [S0, S1, S2, S3, S4] # S0 random · S1 +element exponent ranges · S2 +bond centres
+                              # S3 +bond-aligned anisotropy · S4 +charge-proportional allocation
+seeds: [0, 1, 2]
+log_suffix: ""                # appended to results/ladder_<system><suffix>.log
+
+grid_check: 5

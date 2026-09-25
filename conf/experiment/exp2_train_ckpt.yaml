@@ -1,0 +1,12 @@
+# @package _global_
+# Train and save the splat checkpoint that Figure 3's observables are computed from.
+system: water                 # water | ethanol | alanine_dipeptide
+m: null                       # null => the system's entry in train_ckpt.py (water 192, ethanol 432)
+seed: 0
+
+steps: 12000
+grid_level: 3
+
+grid_check: 5
+
+screen_pad: 2.0

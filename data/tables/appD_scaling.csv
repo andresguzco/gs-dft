@@ -1,0 +1,8 @@
+system,atoms,nao,gsdft_mem_gb,gsdft_time_per_step_s,d4ft_wall_s,dqc_wall_s,pyscf_time_per_cycle_s
+Water,3,58,0.18,0.10,474,19.9,0.7
+Ethanol,9,174,1.37,0.11,4365,29.3,1.2
+(Ala)2,22,468,1.49,0.15,,OOM,4.6
+(Ala)5,53,1158,1.76,0.34,,,22.9
+(Ala)15,153,3358,6.43,2.06,,,238
+(Ala)45,453,9958,9.45,21.0,,,
+Insulin (784 atoms),784,17448,18.43,80.1,,,

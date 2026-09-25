@@ -1,0 +1,8 @@
+code,E_ha,delta_mha,iterations,time_s,note
+PySCF,-76.33344,,7,1.9,
+PySCF (Cartesian),-76.33470,,,,"reference for MESS, from the caption"
+D4FT (float64),-76.33340,+0.038,637,128,
+"D4FT (float32, default)",NaN,,4000,206,
+MESS (Cartesian),-76.92339,-588.7,110,9.7,delta against Cartesian PySCF
+DQC (CPU),-76.33345,-0.010,,15.4,
+GS-DFT (M = 24),-76.26686,+66.6,12000,154,

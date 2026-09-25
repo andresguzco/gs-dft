@@ -1,0 +1,6 @@
+# @package _global_
+# One Gaussian RKS/PBE single point at (R, basis) on the dissociation curve.
+system: lih                   # lih | lif
+r: 1.6                        # bond length, angstrom
+basis: cc-pvdz                # plain or aug-cc-pVXZ
+grid_level: 3                 # matches the splat curve

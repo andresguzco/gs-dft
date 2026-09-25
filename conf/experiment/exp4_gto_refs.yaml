@@ -1,0 +1,4 @@
+# @package _global_
+# Gaussian RKS/PBE references for the bare anions across the plain and augmented ladders.
+system: f_anion               # f_anion | oh_anion
+basis: cc-pvdz

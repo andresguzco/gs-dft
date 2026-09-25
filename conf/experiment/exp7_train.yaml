@@ -1,0 +1,40 @@
+# @package _global_
+# One training run of the size ladder: the FMO proteins of Table 3 and the alanine chains of
+# Figure 2(c). Runs at M = nao of the reference basis on the level-2 grid.
+system: alanine_dipeptide
+
+init_c: random                # random | minao | local: how the orbital coefficients start; the splats
+                              # are always placed by the chemistry-informed initialization
+m_mult: 1.0
+grid_level: 2
+
+steps: 1500
+seed: 0
+
+# --- optimizer --------------------------------------------------------------
+peak_lr: 1e-2                 # peak of the warmup + cosine schedule
+warmup: 0                     # >0 sets the warmup length; 0 => min(steps // 10, 200)
+polish_lr: 0.0                # >0 => constant-lr Adam, to continue a finished run
+
+# --- monitoring -------------------------------------------------------------
+monitor: 25
+grid_check: 4
+cond_every: 0                 # cond(V) of the auxiliary metric every N steps (0 = off)
+nelec_rtol: 1e-3              # stop if the electron count drifts by more than this, relative
+collapse: true                # stop on a non-finite energy or gradient
+
+# --- checkpoint / resume ----------------------------------------------------
+ckpt: null                    # null => results/<tag>_ckpt
+ckpt_every: 50
+resume: true                  # a re-run continues from the checkpoint and appends to the JSONL
+
+# --- output -----------------------------------------------------------------
+out_dir: null                 # null => experiments/exp7_size_ladder/results
+tag: null                     # null => <system>_M<m_mult>x_g<grid>_s<seed>
+
+# --- memory -----------------------------------------------------------------
+grid_chunk: 4096              # grid points per chunk of the density evaluation
+screen_unique: true           # store each pair once (j >= i) with a factor 2 off the diagonal
+skip_pad: true                # skip all-padding pair chunks: about 30% faster for about 40% more peak
+                              # memory; turn it off when memory is the limit
+remat: false                  # jax.checkpoint around the whole energy: less memory, slower
