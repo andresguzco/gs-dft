@@ -141,7 +141,7 @@ If you use this work, please cite the paper. [`CITATION.cff`](CITATION.cff) carr
 metadata, and GitHub's "Cite this repository" reads it.
 
 ```bibtex
-@article{guzmancordero2027gsdft,
+@article{guzmancordero2026gsdft,
   title   = {Scaling Density Functional Theory with Gaussian Splatting},
   author  = {Guzm\'an-Cordero, Andr\'es and Zhang, Cindy and Hassan, Majdi and Skreta, Marta and
              Neklyudov, Kirill and Medvidovi\'c, Matija},
@@ -149,7 +149,7 @@ metadata, and GitHub's "Cite this repository" reads it.
   eprint  = {XXXX.XXXXX},
   archivePrefix = {arXiv},
   primaryClass  = {cs.AI},
-  year    = {2027},
+  year    = {2026},
   url     = {https://arxiv.org/abs/XXXX.XXXXX}
 }
 ```

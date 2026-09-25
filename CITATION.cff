@@ -50,7 +50,7 @@ preferred-citation:
       given-names: "Kirill"
     - family-names: "Medvidović"
       given-names: "Matija"
-  year: 2027
+  year: 2026
 
 # The FMODB structures and their published FMO energies are CC BY-SA 4.0; this repository stores
 # only their IDs (see experiments/common/fmodb.py).
