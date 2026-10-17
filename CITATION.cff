@@ -50,7 +50,15 @@ preferred-citation:
       given-names: "Kirill"
     - family-names: "Medvidović"
       given-names: "Matija"
+  journal: "arXiv preprint"
   year: 2026
+  month: 9
+  url: "https://arxiv.org/abs/2609.31483"
+  identifiers:
+    - type: doi
+      value: "10.48550/arXiv.2609.31483"
+    - type: url
+      value: "https://arxiv.org/abs/2609.31483"
 
 # The FMODB structures and their published FMO energies are CC BY-SA 4.0; this repository stores
 # only their IDs (see experiments/common/fmodb.py).

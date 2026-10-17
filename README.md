@@ -9,6 +9,7 @@
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/)
 [![JAX](https://img.shields.io/badge/built%20with-JAX-orange.svg)](https://github.com/jax-ml/jax)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-2609.31483-b31b1b.svg)](https://arxiv.org/abs/2609.31483)
 
 <img src="experiments/shared/visual_abstract.png" alt="GS-DFT: fixed Gaussian basis functions against a trained splat cloud, and the accuracy per parameter" width="100%">
 
@@ -145,12 +146,12 @@ metadata, and GitHub's "Cite this repository" reads it.
   title   = {Scaling Density Functional Theory with Gaussian Splatting},
   author  = {Guzm\'an-Cordero, Andr\'es and Zhang, Cindy and Hassan, Majdi and Skreta, Marta and
              Neklyudov, Kirill and Medvidovi\'c, Matija},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
-  eprint  = {XXXX.XXXXX},
+  journal = {arXiv preprint arXiv:2609.31483},
+  eprint  = {2609.31483},
   archivePrefix = {arXiv},
-  primaryClass  = {cs.AI},
+  primaryClass  = {physics.chem-ph},
   year    = {2026},
-  url     = {https://arxiv.org/abs/XXXX.XXXXX}
+  url     = {https://arxiv.org/abs/2609.31483}
 }
 ```
 
