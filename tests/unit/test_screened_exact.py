@@ -1,7 +1,7 @@
 """The screened exact streaming Coulomb (``screened_coulomb_energy``).
 
-With the full ordered pair list it reproduces the dense exact E_J and its gradients to machine
-precision, through chunk padding and the ``valid`` mask.
+With the full ordered pair list it reproduces the dense E_J on the same (fused pair-pair) kernel and
+its gradients to machine precision, through chunk padding and the ``valid`` mask.
 """
 import numpy as np
 import jax
@@ -11,7 +11,7 @@ import jax.tree_util as jtu
 import pytest
 
 from gs_dft.basis.spectral import Splat
-from gs_dft.integrals.dense import compute_eri_tensor, coulomb_matrix, coulomb_energy
+from gs_dft.integrals.dense import coulomb_matrix, coulomb_energy
 from gs_dft.coulomb import stream as cs
 from gs_dft.screening import neighbor_pairs
 
@@ -23,6 +23,12 @@ def _system(M=6, seed=0, nocc=3):
     )
     C = jr.normal(jr.PRNGKey(seed + 2), (M, nocc))
     return s, C, jnp.ones(nocc)
+
+def compute_eri_tensor(s):
+    """(ij|kl) on the fused kernel over all M² ordered pairs."""
+    M = s.n_basis
+    i, j = jnp.repeat(jnp.arange(M), M), jnp.tile(jnp.arange(M), M)
+    return cs.full_eri_block_fused(s, i, j, i, j).reshape(M, M, M, M)
 
 def _dense_EJ(s, C, occ):
     P = C @ jnp.diag(occ) @ C.T

@@ -26,7 +26,7 @@ DF, dense vs screened, single- vs multi-device) lives on the
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
@@ -51,7 +51,9 @@ from gs_dft.coulomb import stream as _cs
 from gs_dft.coulomb import ri as _cdf
 from gs_dft.screening import grid as _gscr
 from gs_dft import screening as _scr
+from gs_dft.screening import cells as _cells
 from gs_dft.ks import diagnostics as _mtr
+from gs_dft.ks import resolution as _res
 from gs_dft.ks import shard as _shd
 
 __all__ = ["train", "evaluate", "flops", "TrainResult",
@@ -71,12 +73,16 @@ class Ckpt:
     resume: bool = False
 
 
+NELEC_TOL_PER_ATOM = 1e-4
+"""Grid electron error per atom, |Σwρ − N_e|/N_atoms, past which a run stops once it has been inside
+it. Clean states sit near 1e-5 per atom; the error is extensive, so a fixed count would not scale."""
+
+
 @dataclass(frozen=True)
 class Collapse:
     """Collapse-guard spec (see :func:`collapse`)."""
 
-    base: str
-    nelec_rtol: float = 1e-3
+    nelec_tol_per_atom: float = NELEC_TOL_PER_ATOM
 
 
 def ckpt(base: str, *, every: int = 100, resume: bool = False) -> Ckpt:
@@ -110,11 +116,13 @@ def monitor(every: int = 100, *, cond_every: int = 50, verbose: bool = True) -> 
     return Monitor(every=int(every), cond_every=int(cond_every), verbose=bool(verbose))
 
 
-def collapse(base: str, *, nelec_rtol: float = 1e-3) -> Collapse:
-    """On collapse — a non-finite E/|g|, or an electron count that regresses by more than
-    ``nelec_rtol`` (relative) after having been right — dump the last-good ("before") and
-    first-broken ("after") bundles to ``base``_{before,after} and halt the run."""
-    return Collapse(base=str(base), nelec_rtol=float(nelec_rtol))
+def collapse(*, nelec_tol_per_atom: float = NELEC_TOL_PER_ATOM) -> Collapse:
+    """Stop the run on a non-finite E or |g| (checked every step), or on a grid electron error per
+    atom past ``nelec_tol_per_atom`` once the run has been inside it (checked at the monitor and
+    refresh points; a young run's grid error is large and is not a collapse). The guard keeps no
+    state of the run: the periodic checkpoint is the one to inspect after a stop.
+    :func:`train` runs with ``collapse()`` unless told otherwise."""
+    return Collapse(nelec_tol_per_atom=float(nelec_tol_per_atom))
 
 
 def splat_adam(lr: float = 1e-2, steps: int = 1000, *,
@@ -189,9 +197,12 @@ class TrainResult:
     """Outcome of a :func:`train` run.
 
     ``step``/``energy``/``e_hartree``/``grad_norm`` are the monitor-cadence
-    history as arrays (empty when ``monitor=None``). ``state`` is the last
-    refresh state — pass it straight to :func:`evaluate` /
-    :func:`~gs_dft.ks.forces.splat_forces`.
+    history as arrays (empty when ``monitor=None``). ``nelec_step``/``nelec_err``
+    are the grid electron error per atom at every monitor and refresh point and
+    the last step. ``state`` is the last refresh state — pass it straight to
+    :func:`evaluate` / :func:`~gs_dft.ks.forces.splat_forces`. ``n_cap_*`` count the
+    splats pressed against the grid's sharpness cap, the width floor and the
+    anisotropy limit after the last step (:mod:`gs_dft.ks.resolution`).
     """
 
     model: SplatModel
@@ -202,6 +213,12 @@ class TrainResult:
     energy: np.ndarray
     e_hartree: np.ndarray
     grad_norm: np.ndarray
+    stop_reason: str | None = None          # None ran to the end; "nonfinite" | "nelec" stopped
+    nelec_step: np.ndarray = field(default_factory=lambda: np.zeros(0, int))
+    nelec_err: np.ndarray = field(default_factory=lambda: np.zeros(0))   # (Σwρ − N_e)/N_atoms
+    n_cap_sharp: int = 0
+    n_cap_wide: int = 0
+    n_cap_aniso: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -227,10 +244,24 @@ def _prepare_mesh(ks, model):
     if multinode:
         model = _shd.tree_to_global(model, ks.mesh)
     else:
-        # Commit the model to the mesh before the first step. Left uncommitted it lives on device 0
-        # until step_fn's first output, so step_fn saw two input shardings and compiled twice.
+        # Every input committed as the compiled step reads it, so no call transfers or reshards.
         model = _replicated(model, ks.mesh)
+        ks = _replicated(ks, ks.mesh)
+        split = NamedSharding(ks.mesh, P("g"))
+        ks = eqx.tree_at(lambda k: (k.grid_points, k.grid_weights), ks,
+                         (jax.device_put(ks.grid_points, split), jax.device_put(ks.grid_weights, split)))
     return ks, model, G, multinode, jax.process_index() == 0
+
+
+def _placer(ks, multinode):
+    """Puts a fresh pytree (an optimizer state, a loaded checkpoint) where the step expects it."""
+    if ks.mesh is None:
+        return lambda t: t
+    if multinode:
+        return lambda t: jax.tree.map(
+            lambda x: _shd.to_global(x, ks.mesh) if isinstance(x, jax.Array) and x.is_fully_addressable
+            else x, t)
+    return lambda t: _replicated(t, ks.mesh)
 
 
 def _pair_fill(state, pad_to):
@@ -254,6 +285,20 @@ def _replicated(tree, mesh):
     return eqx.combine(jax.tree.map(lambda x: jax.device_put(x, spec), arr), static)
 
 
+def _placed(state, mesh):
+    """A refresh state committed as the step reads it: the pair list, the cell lists (leading device
+    axis) and the metric factor's rows split over "g", so each device holds its own share and no
+    more; the aux replicated."""
+    split = NamedSharding(mesh, P("g"))
+    put = lambda xs: None if xs is None else tuple(jax.device_put(x, split) for x in xs)
+    return SplatState(
+        pairs=put(state.pairs),
+        aux=None if state.aux is None else _replicated(state.aux, mesh),
+        aux_K=None if state.aux_K is None else _replicated(state.aux_K, mesh),
+        cholV=None if state.cholV is None else jax.device_put(state.cholV, split),
+        cells=None if state.cells is None else tuple(put(g) for g in state.cells))
+
+
 def _on_one_device(tree):
     """Pin every array leaf of `tree` to this process's first LOCAL device.
 
@@ -265,13 +310,18 @@ def _on_one_device(tree):
     return eqx.combine(jax.tree.map(lambda x: jax.device_put(x, dev), arr), static)
 
 
-def _refresh_state(ks, basis, pad_to, multinode):
-    """One refresh: pairs (fixed pad, overflow-capped) + frozen product aux;
-    multi-node, the products are promoted to global arrays (the pair list is
-    replicated — the shard_map reshards it to "g").
+def _local_copy(tree):
+    """This process's copy of a replicated global pytree."""
+    return jax.tree.map(lambda x: x.addressable_data(0) if isinstance(x, jax.Array) else x, tree)
 
-    On a mesh the rebuild runs on ONE device and the products are broadcast. Its outputs are
-    replicated, so running it with mesh-resident inputs executed the same work redundantly on
+
+def _refresh_state(ks, basis, pad_to, multinode, like=None):
+    """One refresh: pairs (fixed pad; an overflow raises) + frozen product aux + cell lists at
+    ``like``'s widths (an overflow raises); on a mesh the pair list, the cell lists and the metric
+    factor's rows are split over "g" (``_placed``), multi-node as global arrays.
+
+    On a mesh the rebuild runs on ONE device and the products are then placed. Running it with
+    mesh-resident inputs executed the same work redundantly on
     every device with each dispatch gated by the slowest: measured 4.2x on 4 GPUs (PJM49,
     0.18 -> 0.77 s) and reproduced at 4.6x on a 4-device CPU mesh. Pinning the inputs also
     fixes the products' sharding, which is what stops the jitted step recompiling: uncommitted
@@ -282,15 +332,18 @@ def _refresh_state(ks, basis, pad_to, multinode):
     # `to_global` path below instead -- these are different promotions and an early return here
     # would make that branch unreachable.
     if ks.mesh is not None and not multinode:
-        return _replicated(refresh(ks, _on_one_device(basis), pad_to=pad_to), ks.mesh)
-    state = refresh(ks, basis, pad_to=pad_to)
+        return _placed(refresh(ks, _on_one_device(basis), pad_to=pad_to, like=like), ks.mesh)
+    # Multi-node, each process rebuilds from its own copy of the replicated basis, then promotes.
+    state = refresh(ks, _local_copy(basis) if multinode else basis, pad_to=pad_to, like=like)
     if multinode:
+        split = lambda x: _shd.to_global(x, ks.mesh, sharded=True)      # as _placed lays them out
         state = SplatState(
-            pairs=None if state.pairs is None else tuple(
-                _shd.to_global(x, ks.mesh) for x in state.pairs),
+            pairs=None if state.pairs is None else tuple(split(x) for x in state.pairs),
             aux=None if state.aux is None else _shd.tree_to_global(state.aux, ks.mesh),
             aux_K=None if state.aux_K is None else _shd.tree_to_global(state.aux_K, ks.mesh),
-            cholV=None if state.cholV is None else _shd.to_global(state.cholV, ks.mesh),
+            cholV=state.cholV,                  # already global: ri.metric_factor builds it on the mesh
+            cells=None if state.cells is None else tuple(
+                tuple(split(x) for x in g) for g in state.cells),
         )
     return state
 
@@ -300,6 +353,95 @@ def _partition(model):
     filt = eqx.tree_at(lambda m: m.occupations, jax.tree.map(lambda _: True, model),
                        replace=False)
     return eqx.partition(model, filt)
+
+
+def _pad_of(ks, basis, G):
+    """The pair pad frozen for the run: ``ks.screen.pad`` × the significant count now, a multiple of
+    the mesh size. ``(pad, n0)``; ``(None, None)`` when ``ks`` does not screen."""
+    if ks.screen is None:
+        return None, None
+    n0 = _scr.count_pairs(basis, eps=ks.screen.eps, unique=ks.screen.unique)
+    return -(-int(ks.screen.pad * n0) // G) * G, n0
+
+
+def _capped(m_tr, res, atoms):
+    return eqx.tree_at(lambda m: m.basis, m_tr, _res.capped(m_tr.basis, res, atoms))
+
+
+def zero_sharded(inner: optax.GradientTransformation, mesh) -> optax.GradientTransformation:
+    """``inner`` with its state split over ``mesh``'s axis "g" (ZeRO-1): every leaf is raveled and padded
+    to whole device shares, so a device keeps 1/G of the moments and updates only its share; the
+    updates come back whole, in the leaves' shapes. For elementwise transformations (Adam, clipping by
+    the global norm, whose norm the compiler sums over the devices): the same arithmetic per element,
+    and the pad's zeros stay zero."""
+    G = int(mesh.size)
+    split, whole = NamedSharding(mesh, P("g")), NamedSharding(mesh, P())
+
+    def flat(t):
+        return jax.tree.map(lambda x: jax.lax.with_sharding_constraint(
+            jnp.pad(jnp.ravel(x), (0, (-x.size) % G)), split), t)
+
+    def init(params):
+        return inner.init(flat(params))
+
+    def update(updates, state, params=None):
+        u, state = inner.update(flat(updates), state, None if params is None else flat(params))
+        u = jax.tree.map(lambda v, x: jax.lax.with_sharding_constraint(v[:x.size].reshape(x.shape), whole),
+                         u, updates)
+        return u, state
+
+    return optax.GradientTransformation(init, update)
+
+
+def _opt_initializer(opt, mesh, m_tr):
+    """``opt.init`` compiled once, with the state where the step expects it: the moments split over
+    "g" (:func:`zero_sharded`) and every scalar replicated."""
+    split, whole = NamedSharding(mesh, P("g")), NamedSharding(mesh, P())
+    shardings = jax.tree.map(lambda a: split if a.ndim else whole, jax.eval_shape(opt.init, m_tr))
+    return jax.jit(opt.init, out_shardings=shardings)
+
+
+def _step_fn(opt, m_st, remat):
+    """One optimizer step, the splats then projected onto the grid's resolution cap and the width
+    limits (the optimizer state untouched). ``ks``, the state and the resolution ``res`` are
+    arguments (``fixed``): a multi-host grid cannot be captured by a jit, and a captured state would be
+    compiled in as constants."""
+    def step_fn(fixed, m_tr, opt_state):
+        ks_, state, res = fixed
+        def E(tr):
+            return ks_(eqx.combine(tr, m_st), state)
+        E_ = jax.checkpoint(E) if remat else E
+        (e, eaux), g = jax.value_and_grad(E_, has_aux=True)(m_tr)
+        gnorm = optax.global_norm(g)
+        u, opt_state = opt.update(g, opt_state, m_tr)
+        m_tr = _capped(eqx.apply_updates(m_tr, u), res, ks_.atom_coords)
+        # Not a no-op on a mesh. Replicated params are recomputed per device through regeigh, an
+        # eigendecomposition of a near-degenerate overlap, so a last-bit difference between copies
+        # amplifies into divergent updates. Must stay unconditional.
+        if ks_.mesh is not None:
+            m_tr = _shd.sync_replicas(m_tr, ks_.mesh)
+        return m_tr, opt_state, e, eaux, gnorm, _res.cap_counts(m_tr.basis, res, ks_.atom_coords)
+    return eqx.filter_jit(step_fn)
+
+
+def _compiled_step(step_fn, *args):
+    """``step_fn`` compiled ahead of time for ``args``. A call with another shape, dtype or sharding
+    raises instead of recompiling (a mid-run compile deadlocks a mesh)."""
+    compiled = step_fn.lower(*args).compile()
+    if os.environ.get("DFTAX_AOT_ANALYZE"):
+        # compile-only probe: names the temps behind a step OOM without allocating them
+        mem = compiled.compiled.memory_analysis()
+        print(f"AOT temp={mem.temp_size_in_bytes/2**30:.2f}GiB "
+              f"args={mem.argument_size_in_bytes/2**30:.2f}GiB "
+              f"out={mem.output_size_in_bytes/2**30:.2f}GiB", flush=True)
+        hlo = os.environ["DFTAX_AOT_ANALYZE"]
+        if hlo != "1":   # a path => dump the HLO so the big temps can be named by shape
+            txt = compiled.compiled.as_text()
+            with open(hlo, "w") as fh:
+                fh.write(txt)
+            print(f"AOT hlo -> {hlo} ({len(txt)/2**20:.0f} MiB)", flush=True)
+        raise SystemExit(0)
+    return compiled
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +456,13 @@ def train(ks: SplatKS, model: SplatModel, *,
           monitor: "Monitor | None" = Monitor(),
           remat: bool = False,
           checkpoint: Ckpt | None = None,
-          guard: Collapse | None = None,
+          guard: Collapse | None = Collapse(),
           snapshot_every: int = 0, snapshot_cb: "Callable | None" = None,
           step_cb: "Callable | None" = None) -> TrainResult:
     """Variationally minimize ``ks`` over {splats, C} (occupations frozen).
+
+    The step is compiled once, ahead of time, before step 0: a shape, dtype or sharding change
+    raises instead of recompiling.
 
     Args:
         ks: the built energy functional — its ``coulomb``/``screen``/``mesh``
@@ -331,15 +476,14 @@ def train(ks: SplatKS, model: SplatModel, *,
         refresh_every: host-rebuild cadence for the pair list / frozen aux as
             the splats move (0 = never). The pair pad is fixed for the whole
             run at ``ks.screen.pad ×`` the initial significant count (rounded
-            to the device count); overflow keeps the largest-overlap pairs, so
-            the jitted step compiles once (the constant-shape contract; see
-            ``gs_dft.screening``).
+            to the device count); a refresh that overflows it raises
+            :class:`~gs_dft.screening.PairPadOverflow`.
         monitor: a :func:`monitor` spec — what to observe and how often
             (``None`` = silent, empty history arrays).
         remat: ``jax.checkpoint`` the loss (lower peak memory, one extra
             forward per step) — only when a run would otherwise OOM.
         checkpoint: a :func:`ckpt` value (atomic save/resume).
-        guard: a :func:`collapse` value (dump + halt on blow-up).
+        guard: a :func:`collapse` value (on by default; ``None`` turns it off).
         snapshot_every: cadence of ``snapshot_cb`` (0 = never).
         snapshot_cb: ``snapshot_cb(step, model, aux, E)`` at that cadence
             (frame 0 included on fresh runs).
@@ -350,113 +494,108 @@ def train(ks: SplatKS, model: SplatModel, *,
     """
     _check_electrons(ks, model)
     ks, model, G, multinode, rank0 = _prepare_mesh(ks, model)
+    place = _placer(ks, multinode)
+    n_e = float(jnp.sum(model.occupations))
+    n_atoms = int(ks.atom_coords.shape[0])
 
-    # --- refresh products: fixed pair pad (compile-once), frozen product aux ---
-    pad_to = None
-    if ks.screen is not None:
-        n0 = int(_scr.neighbor_pairs(model.basis, eps=ks.screen.eps,
-                                     unique=ks.screen.unique)[0].shape[0])
-        pad_to = -(-int(ks.screen.pad * n0) // G) * G
-    state = _refresh_state(ks, model.basis, pad_to, multinode)
-    _n_pairs, _pair_fill_frac = (_pair_fill(state, pad_to) if not multinode else (None, None))
+    # --- the grid's resolution cap and the width limits, on the splats from the start ---
+    say = rank0 and monitor is not None and monitor.verbose
+    res = place(_res.grid_resolution(ks, verbose=say))
+    cap = eqx.filter_jit(_capped)
+    model = cap(model, res, ks.atom_coords)
+    caps = np.asarray(_res.cap_counts(model.basis, res, ks.atom_coords)).tolist()
+    if say:
+        print(f"  cap at start: {caps[0]} sharp / {caps[1]} wide / {caps[2]} anisotropic splats"
+              + ("" if res is not None else " (no shells in the grid: width limits only)"), flush=True)
 
     m_tr, m_st = _partition(model)
     opt = splat_adam(1e-2, steps) if optimizer is None else optimizer
-    opt_state = opt.init(m_tr)
+    # On one process's mesh the optimizer state is split over the devices (each keeps 1/G of the
+    # moments); multi-node keeps it replicated, since rank 0 alone writes the checkpoint.
+    if ks.mesh is not None and not multinode:
+        opt = zero_sharded(opt, ks.mesh)
+        fresh_opt = _opt_initializer(opt, ks.mesh, m_tr)
+        put_opt = lambda t, like: jax.device_put(t, jax.tree.map(lambda x: x.sharding, like))
+    else:
+        fresh_opt = lambda t: place(opt.init(t))
+        put_opt = lambda t, like: place(t)
+    opt_state = fresh_opt(m_tr)
 
-    @eqx.filter_jit
-    def step_fn(ks_, m_tr, opt_state, state):    # ks_/state as ARGS, not closed over: the
-        def E(tr):                                # sharded global grid inside ks_ can't be
-            m = eqx.combine(tr, m_st)             # captured by a jit in multi-host
-            return ks_(m, state)
-        E_ = jax.checkpoint(lambda tr: E(tr)) if remat else E
-        (e, eaux), g = jax.value_and_grad(lambda tr: E_(tr), has_aux=True)(m_tr)
-        gnorm = optax.global_norm(g)
-        u, opt_state = opt.update(g, opt_state, m_tr)
-        m_tr = eqx.apply_updates(m_tr, u)
-        # Not a no-op on a mesh. Replicated params are recomputed per device through regeigh, an
-        # eigendecomposition of a near-degenerate overlap, so a last-bit difference between copies
-        # amplifies into divergent updates. Must stay unconditional.
-        if ks_.mesh is not None:
-            m_tr = _shd.sync_replicas(m_tr, ks_.mesh)
-        return m_tr, opt_state, e, eaux, gnorm
-
-    if os.environ.get("DFTAX_AOT_ANALYZE"):
-        # compile-only probe: names the temps behind a jit_step_fn OOM without allocating them
-        compiled = step_fn.lower(ks, m_tr, opt_state, state).compile().compiled
-        mem = compiled.memory_analysis()
-        print(f"AOT temp={mem.temp_size_in_bytes/2**30:.2f}GiB "
-              f"args={mem.argument_size_in_bytes/2**30:.2f}GiB "
-              f"out={mem.output_size_in_bytes/2**30:.2f}GiB", flush=True)
-        hlo = os.environ["DFTAX_AOT_ANALYZE"]
-        if hlo != "1":   # a path => dump the HLO so the big temps can be named by shape
-            pathlib_txt = compiled.as_text()
-            with open(hlo, "w") as fh:
-                fh.write(pathlib_txt)
-            print(f"AOT hlo -> {hlo} ({len(pathlib_txt)/2**20:.0f} MiB)", flush=True)
-        raise SystemExit(0)
-
-    # --- resume ---
+    # --- resume: before the lists are sized, so a restart after an overflow sizes them anew ---
     start = 0
     if checkpoint is not None and checkpoint.resume:
         loaded = _load_ckpt(checkpoint.base, m_tr, opt_state)
         if loaded is not None:
-            m_tr, opt_state, start = loaded
-            state = _refresh_state(ks, eqx.combine(m_tr, m_st).basis, pad_to, multinode)
+            m_tr, loaded_opt, start = loaded
+            m_tr, opt_state = place(cap(m_tr, res, ks.atom_coords)), put_opt(loaded_opt, opt_state)
             if rank0:
                 print(f"  resumed from {checkpoint.base} at step {start}/{steps}", flush=True)
+    basis0 = eqx.combine(m_tr, m_st).basis
+
+    # --- refresh products: fixed pair pad (compile-once), frozen product aux ---
+    pad_to, n0 = _pad_of(ks, _local_copy(basis0), G)             # counted on one device
+
+    def rebuild(basis, at, like=None):
+        # `like`: the cell lists keep the first build's widths (compile once).
+        try:
+            return _refresh_state(ks, basis, pad_to, multinode, like=like)
+        except _scr.PairPadOverflow as exc:
+            raise _scr.PairPadOverflow(
+                f"step {at}: {exc} (pad = {ks.screen.pad:g} x the {n0} pairs of step {start})") from exc
+        except _cells.CellOverflow as exc:
+            raise _cells.CellOverflow(f"step {at}: {exc}") from exc
+
+    state = rebuild(basis0, start)
+    _n_pairs, _pair_fill_frac = (_pair_fill(state, pad_to) if not multinode else (None, None))
+
+    step = _compiled_step(_step_fn(opt, m_st, remat), (ks, state, res), m_tr, opt_state)
 
     if snapshot_every and snapshot_cb is not None and start == 0:   # frame 0
         snapshot_cb(0, eqx.combine(m_tr, m_st), state.aux, float("nan"))
 
-    # `nelec_ref` arms the electron-count guard: a regression after the run has integrated to
-    # Σocc is corruption, not physics — see CollapseGuard._nelec_bad for the rule and why
-    # finiteness checks alone miss it.
-    cguard = (CollapseGuard(guard.base,
-                            lambda path, bundle, step: (_save_ckpt(path, bundle[0], bundle[1], step)
-                                                        if rank0 else None),
-                            nelec_ref=float(jnp.sum(model.occupations)), nelec_rtol=guard.nelec_rtol)
+    cguard = (CollapseGuard(nelec_ref=n_e, nelec_tol=guard.nelec_tol_per_atom * n_atoms)
               if guard is not None else None)
 
     hist_step, hist_e, hist_ej, hist_g = [], [], [], []
-    collapsed = False
+    nel_step, nel_err = [], []
+    stop_reason = None
     i = start
     for i in range(start, steps):
-        if refresh_every and i and i % refresh_every == 0:      # splats moved
-            # DFTAX_REFRESH_PROF=1 attributes the refresh step's cost across the rebuild, the
-            # pair-fill host sync, and the step that follows. Off, this is one extra `if`.
-            _prof = os.environ.get("DFTAX_REFRESH_PROF")
-            if _prof:
-                import time as _time
-                _t0 = _time.time()
-                state = _refresh_state(ks, eqx.combine(m_tr, m_st).basis, pad_to, multinode)
-                jax.block_until_ready(jax.tree.leaves(eqx.filter(state, eqx.is_array)))
-                _t1 = _time.time()
-                _n_pairs, _pair_fill_frac = ((None, None) if multinode
-                                             else _pair_fill(state, pad_to))
-                _t2 = _time.time()
-                print(f"# REFRESH_PROF step={i} rebuild={_t1 - _t0:.3f}s "
-                      f"pair_fill={_t2 - _t1:.3f}s", flush=True)
-            else:
-                state = _refresh_state(ks, eqx.combine(m_tr, m_st).basis, pad_to, multinode)
-                if not multinode:
-                    _n_pairs, _pair_fill_frac = _pair_fill(state, pad_to)
+        refreshed = bool(refresh_every and i and i % refresh_every == 0)
+        if refreshed:                                            # splats moved
+            try:
+                state = rebuild(eqx.combine(m_tr, m_st).basis, i, like=state)
+            except (_scr.PairPadOverflow, _cells.CellOverflow):
+                # The point is valid, only its lists outgrew the run's: save it, so a restart
+                # resumes here with lists sized to this cloud.
+                if rank0 and checkpoint is not None and checkpoint.every:
+                    _save_ckpt(checkpoint.base, m_tr, opt_state, i)
+                raise
+            if not multinode:
+                _n_pairs, _pair_fill_frac = _pair_fill(state, pad_to)
             if reset_opt_on_refresh:
                 # A refresh changes the energy functional discontinuously, so Adam's moments hold
                 # curvature from the old one. Dropping them costs the warmed-up per-coordinate
                 # scaling, so expect a transient after every refresh.
-                opt_state = opt.init(eqx.filter(m_tr, eqx.is_inexact_array))
-        cur_bundle = (m_tr, opt_state)             # pre-update refs — guard's "after" on collapse
-        m_tr, opt_state, E, eaux, gnorm = step_fn(ks, m_tr, opt_state, state)
-        if cguard is not None and cguard.check(i, cur_bundle, E, gnorm,
-                                               nelec=float(eaux.nelec)):
+                opt_state = fresh_opt(eqx.filter(m_tr, eqx.is_inexact_array))
+        m_tr, opt_state, E, eaux, gnorm, n_cap = step((ks, state, res), m_tr, opt_state)
+
+        do_monitor = bool(monitor is not None and monitor.every
+                          and (i % monitor.every == 0 or i == steps - 1))
+        # The grid electron error per atom, at the monitor and refresh points (and the ends).
+        nel = (float(eaux.nelec) if (do_monitor or refreshed or i in (start, steps - 1))
+               else None)
+        if nel is not None:
+            nel_step.append(i)
+            nel_err.append((nel - n_e) / n_atoms)
+        if cguard is not None and cguard.check(i, E, gnorm, nelec=nel):
+            stop_reason = cguard.reason
             if rank0:
-                why = ("" if cguard.reason != "nelec" else
-                       f" nelec={float(eaux.nelec):.4f} vs {cguard.nelec_ref:.4f}")
-                print(f"  step {i:4d}  *** COLLAPSE ({cguard.reason}) *** E={float(E):.4e} "
-                      f"|g|={float(gnorm):.2e}{why}"
-                      f" — saved {guard.base}_{{before,after}}; halting", flush=True)
-            collapsed = True
+                why = ("" if stop_reason != "nelec" else
+                       f" grid electron error {nel_err[-1]:+.2e}/atom past "
+                       f"{guard.nelec_tol_per_atom:g}/atom")
+                print(f"  step {i:4d}  *** STOP ({stop_reason}) *** E={float(E):.4e} "
+                      f"|g|={float(gnorm):.2e}{why}", flush=True)
             break
         if rank0 and checkpoint is not None and checkpoint.every and (
                 (i + 1) % checkpoint.every == 0 or i == steps - 1):
@@ -465,14 +604,15 @@ def train(ks: SplatKS, model: SplatModel, *,
                 (i + 1) % snapshot_every == 0 or i == steps - 1):
             snapshot_cb(i + 1, eqx.combine(m_tr, m_st), state.aux, float(E))
 
-        do_monitor = (monitor is not None and monitor.every
-                      and (i % monitor.every == 0 or i == steps - 1))
         if step_cb is None and not do_monitor:
             continue
         m_ = {"step": i, "E_total": float(E), "grad_norm": float(gnorm),
               "E_kinetic": float(eaux.kinetic), "E_hartree": float(eaux.hartree),
               "E_xc": float(eaux.xc), "E_external": float(eaux.external),
               "nelec": float(eaux.nelec)}
+        m_["nelec_err_per_atom"] = (m_["nelec"] - n_e) / n_atoms
+        caps = np.asarray(n_cap).tolist()
+        m_["n_cap_sharp"], m_["n_cap_wide"], m_["n_cap_aniso"] = caps
         if _n_pairs is not None:
             m_["n_pairs"] = _n_pairs                  # significant pairs at the last refresh
             m_["pair_fill"] = _pair_fill_frac         # ... as a fraction of the frozen pad
@@ -495,25 +635,77 @@ def train(ks: SplatKS, model: SplatModel, *,
                          f"  λmin/λmax={m_.get('dense_eig_ratio', float('nan')):.2e}"
                          if lo is not None else "")
                 extra += f"  cond(V)={cv:.1e}" if cv is not None else ""
-                print(f"  step {i:4d}  E={float(E):.6f}  |g|={float(gnorm):.2e}{extra}",
-                      flush=True)
+                print(f"  step {i:4d}  E={float(E):.6f}  |g|={float(gnorm):.2e}"
+                      f"  dN/atom={m_['nelec_err_per_atom']:+.1e}"
+                      f"  cap s/w/a={caps[0]}/{caps[1]}/{caps[2]}{extra}", flush=True)
 
+    if steps > start:
+        caps = np.asarray(n_cap).tolist()
     return TrainResult(
         model=eqx.combine(m_tr, m_st), state=state,
-        n_steps=(i + 1 if steps > start else start), collapsed=collapsed,
+        n_steps=(i + 1 if steps > start else start), collapsed=stop_reason is not None,
         step=np.asarray(hist_step, dtype=int), energy=np.asarray(hist_e),
         e_hartree=np.asarray(hist_ej), grad_norm=np.asarray(hist_g),
+        stop_reason=stop_reason, nelec_step=np.asarray(nel_step, dtype=int),
+        nelec_err=np.asarray(nel_err),
+        n_cap_sharp=caps[0], n_cap_wide=caps[1], n_cap_aniso=caps[2],
     )
+
+
+# Overlap cutoff of the pair list the reported energy is evaluated on (E_J and V_ne):
+# ≤ 1 µHa from the unscreened list (experiments/kernels/check_evaluate.py).
+_EVAL_EPS = 1e-12
+
+
+@eqx.filter_jit
+def _evaluate_energy(ks, model, pairs, aux_K):
+    """The reported energy, compiled as one function; every array is an argument (a closure
+    would compile it in as a constant)."""
+    coords, charges = ks.atom_coords, ks.atom_charges
+    occ = model.occupations
+    pi, pj, w = pairs
+    # S and T are never formed — see `SplatKS._finish`; the contractions carry (M, n_occ).
+    C = orthonormalize(model.C, model.C.T @ _full.overlap_times(model.basis, model.C))
+    E_kin = occ @ jnp.sum(C * _full.kinetic_times(model.basis, C), axis=0)
+    E_ext = _scr.screened_external_energy(model.basis, C, occ, pi, pj, coords, charges, w)
+    # Second implementation of the energy tail: every term added to `SplatKS._finish` must be
+    # added here too, or the audit silently disagrees with the objective it audits.
+    kind = ks.xc.xc_type
+    if kind == "MGGA":
+        rho, grad, tau = _gscr.chunked_density_grad_tau(model.basis, C, occ, ks.grid_points)
+    else:
+        rho, grad = _gscr.chunked_density_and_grad(model.basis, C, occ, ks.grid_points)
+        tau = None
+        if kind != "GGA":
+            grad = None
+    E_J = _cs.screened_coulomb_energy(model.basis, C, occ, pi, pj, w)    # exact ERI, unique pairs
+    a_x = ks.coulomb.hf_coeff
+    E_K = (_cdf.df_exchange_energy(model.basis, C, aux_K)
+           if a_x > 0.0 else 0.0)                            # RI-K (exact-K infeasible)
+    a_lr = getattr(ks.coulomb, "hf_coeff_lr", 0.0)
+    E_K_lr = (_cdf.df_exchange_energy(model.basis, C, aux_K,
+                                      omega=getattr(ks.coulomb, "omega", 0.0))
+              if a_lr != 0.0 else 0.0)
+    rho = jnp.maximum(rho, 1e-30)
+    E_xc = xc_energy(ks.xc, rho, ks.grid_weights, grad_rho=grad, tau=tau)
+    nlc_b = float(getattr(ks.xc, "nlc_b", 0.0) or 0.0)
+    if nlc_b:
+        from gs_dft.ks.nlc import vv10_energy
+        E_xc = E_xc + vv10_energy(rho, jnp.sum(grad ** 2, axis=-1), ks.grid_points,
+                                  ks.grid_weights, b=nlc_b,
+                                  c=float(getattr(ks.xc, "nlc_c", 0.0) or 0.0))
+    E_nn = nuclear_repulsion(coords, charges)
+    return E_kin + E_ext + E_J + a_x * E_K + a_lr * E_K_lr + E_xc + E_nn
 
 
 def evaluate(ks: SplatKS, model: SplatModel, state: SplatState | None = None) -> float:
     """Exact-Coulomb energy of a converged model, streamed at O(M²) memory.
 
-    E_J is the exact streaming Coulomb; hybrids use RI-K exchange with the
-    converged K-aux (the exact M⁴ exchange tensor does not fit at the sizes
-    where splats win, and RI-K is the method's own ~1 mHa exchange). The
-    one-electron energies stream over the full pair list and the grid density
-    streams in chunks, so no dense (M, M, 3, 3) or (G, M) buffer ever forms.
+    E_J is the exact ERI over the unique pairs with |Ŝ_ij| > 1e-12 (fused pair-pair kernel), V_ne
+    streams over the same list; hybrids use RI-K exchange with the converged K-aux (the exact M⁴
+    exchange tensor does not fit at the sizes where splats win, and RI-K is the method's own
+    ~1 mHa exchange). The grid density streams in chunks, so no dense (M, M, 3, 3) or (G, M)
+    buffer ever forms. One compiled function.
 
     Args:
         ks: the built energy functional; its grid is the quadrature used. To
@@ -531,43 +723,9 @@ def evaluate(ks: SplatKS, model: SplatModel, state: SplatState | None = None) ->
     if a_x != 0.0 and (state is None or state.aux_K is None):
         raise ValueError("evaluate: a hybrid ks needs state.aux_K (the converged K-aux) — "
                          "pass the training run's `res.state`, or refresh(ks, model.basis).")
-    coords, charges = ks.atom_coords, ks.atom_charges
-    occ = model.occupations
-    pi, pj, v = _scr.neighbor_pairs(model.basis, eps=-1.0)   # full list — exact, streamed V_ne
-    # S and T are never formed — see `SplatKS._finish`; the contractions carry (M, n_occ). P is
-    # still built here because the exact streamed E_J below takes the density matrix itself.
-    C = orthonormalize(model.C, model.C.T @ _full.overlap_times(model.basis, model.C))
-    P = C @ jnp.diag(occ) @ C.T
-    E_kin = occ @ jnp.sum(C * _full.kinetic_times(model.basis, C), axis=0)
-    E_ext = _scr.screened_external_energy(                   # V_ne streamed, full pair list
-        model.basis, C, occ, pi, pj, coords, charges, v)
-    # Second implementation of the energy tail: every term added to `SplatKS._finish` must be
-    # added here too, or the audit silently disagrees with the objective it audits.
-    kind = ks.xc.xc_type
-    if kind == "MGGA":
-        rho, grad, tau = _gscr.chunked_density_grad_tau(model.basis, C, occ, ks.grid_points)
-    else:
-        rho, grad = _gscr.chunked_density_and_grad(model.basis, C, occ, ks.grid_points)
-        tau = None
-        if kind != "GGA":
-            grad = None
-    E_J = _cs.full_coulomb_energy(model.basis, P)            # exact streaming, O(M²)
-    E_K = (_cdf.df_exchange_energy(model.basis, C, state.aux_K)
-           if a_x > 0.0 else 0.0)                            # RI-K (exact-K infeasible)
-    a_lr = getattr(ks.coulomb, "hf_coeff_lr", 0.0)
-    E_K_lr = (_cdf.df_exchange_energy(model.basis, C, state.aux_K,
-                                      omega=getattr(ks.coulomb, "omega", 0.0))
-              if a_lr != 0.0 else 0.0)
-    rho = jnp.maximum(rho, 1e-30)
-    E_xc = xc_energy(ks.xc, rho, ks.grid_weights, grad_rho=grad, tau=tau)
-    nlc_b = float(getattr(ks.xc, "nlc_b", 0.0) or 0.0)
-    if nlc_b:
-        from gs_dft.ks.nlc import vv10_energy
-        E_xc = E_xc + vv10_energy(rho, jnp.sum(grad ** 2, axis=-1), ks.grid_points,
-                                  ks.grid_weights, b=nlc_b,
-                                  c=float(getattr(ks.xc, "nlc_c", 0.0) or 0.0))
-    E_nn = nuclear_repulsion(coords, charges)
-    return float(E_kin + E_ext + E_J + a_x * E_K + a_lr * E_K_lr + E_xc + E_nn)
+    pairs = _scr.neighbor_pairs(model.basis, eps=_EVAL_EPS, unique=True)
+    aux_K = None if state is None else state.aux_K
+    return float(_evaluate_energy(ks, model, pairs, aux_K))
 
 
 def flops(ks: SplatKS, model: SplatModel, *,
@@ -575,30 +733,16 @@ def flops(ks: SplatKS, model: SplatModel, *,
           steps: int = 1000) -> float:
     """Compile-time XLA FLOP estimate of ONE training step (no execution).
 
-    Builds the same jitted step as :func:`train` (with a fresh refresh state)
-    and reads the lowered module's cost analysis. ``steps`` only shapes the
-    default optimizer's schedule.
+    Lowers the same step as :func:`train` (with a fresh refresh state) and reads the lowered
+    module's cost analysis. ``steps`` only shapes the default optimizer's schedule.
     """
-    pad_to = None
-    if ks.screen is not None:
-        G = 1 if ks.mesh is None else int(ks.mesh.size)      # mesh needs a G-multiple pad
-        n0 = int(_scr.neighbor_pairs(model.basis, eps=ks.screen.eps,
-                                     unique=ks.screen.unique)[0].shape[0])
-        pad_to = -(-int(ks.screen.pad * n0) // G) * G
+    G = 1 if ks.mesh is None else int(ks.mesh.size)
+    pad_to, _ = _pad_of(ks, model.basis, G)
     state = refresh(ks, model.basis, pad_to=pad_to)
     m_tr, m_st = _partition(model)
     opt = splat_adam(1e-2, steps) if optimizer is None else optimizer
-    opt_state = opt.init(m_tr)
-
-    @eqx.filter_jit
-    def step_fn(ks_, m_tr, opt_state, state):
-        def E(tr):
-            return ks_(eqx.combine(tr, m_st), state)
-        (e, eaux), g = jax.value_and_grad(E, has_aux=True)(m_tr)
-        u, opt_state = opt.update(g, opt_state, m_tr)
-        return eqx.apply_updates(m_tr, u), opt_state, e
-
-    lowered = step_fn.lower(ks, m_tr, opt_state, state)
+    lowered = _step_fn(opt, m_st, False).lower((ks, state, _res.grid_resolution(ks)), m_tr,
+                                               opt.init(m_tr))
     low = getattr(lowered, "lowered", lowered)        # unwrap the equinox Lowered
     ca = low.cost_analysis()
     if ca is None:                                    # newer jax: analysis needs the compile

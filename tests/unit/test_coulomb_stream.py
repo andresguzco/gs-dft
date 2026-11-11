@@ -93,7 +93,7 @@ def _wide_system(M=24, seed=5):
 
 def test_fused_block_quadrature_converged_and_matches_schur():
     """Default nodes against 128 (quadrature convergence, values and gradients), and a loose check
-    against the Schur kernel, whose 20-node half-line rule is off by up to 1e-2 on core-core pairs."""
+    against the Schur kernel on the shared half-line table (``dense.LAPLACE_NODES``)."""
     s = _wide_system()
     M = s.n_basis
     pi, pj, _ = cs.make_pairs(M, True)

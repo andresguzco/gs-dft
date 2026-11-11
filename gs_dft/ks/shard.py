@@ -6,8 +6,8 @@ axis ``"g"``:
 
   - XC over GRID BLOCKS         (each device sums its block slice; ``psum`` the partial E_xc)
   - 1e energies over PAIRS      (``psum`` the partial E_kin, E_ext)
-  - Coulomb γ over PAIRS        (``psum`` the partial γ), then the (N_aux,N_aux) metric solve
-                                ½γᵀ(V+λI)⁻¹γ runs REPLICATED on the psum'd γ
+  - Coulomb γ over PAIRS        (``psum`` the partial γ), then the metric solve ½γᵀ(V+λI)⁻¹γ on
+                                the psum'd γ, with the factor's ROWS dealt over the devices
   - E_nn replicated; the Löwdin eigh (replicated, ~0.5%) is the caller's, done before this.
 
 Autodiff flows through every ``psum`` (its transpose is ``psum``), so the sharded value AND
@@ -25,12 +25,13 @@ from jax.sharding import Mesh, PartitionSpec as P
 from jax import shard_map
 from jax.experimental.multihost_utils import host_local_array_to_global_array
 
-from gs_dft.integrals.dense import overlap_times_rows, kinetic_times_rows
+from gs_dft.integrals.dense import overlap_times_rows, kinetic_times_rows, _PAIR_BUDGET
 from gs_dft.ks.orthonormalize import transform as _lowdin_transform
 from gs_dft.screening.grid import chunked_density_and_grad
-from gs_dft.screening.cells import cell_density_and_grad
+from gs_dft.screening.cells import cell_density_and_grad, CHUNK_BYTES
 from gs_dft.screening import screened_external_energy, density_pairs
-from gs_dft.coulomb.ri import df_coulomb_gamma_screened, df_coulomb_solve
+from gs_dft.screening.pairs import EXT_CHUNK
+from gs_dft.coulomb.ri import df_coulomb_gamma_screened, df_coulomb_solve, df_coulomb_solve_rows
 from gs_dft.coulomb.stream import full_eri_block_schur, _chunked_pairs
 from dftax.energy.grid import xc_energy
 from dftax.energy.xc import PBE
@@ -179,9 +180,10 @@ def sharded_screened_energy(basis, C, occ, aux, coords, charges, pairs, gp, gw, 
     slice → partial E_xc → psum (O(grid_chunk·M) memory, grid-size-independent). ``pairs`` =
     (pi, pj, valid), pair count a multiple of G.
 
-    ``hartree="df"`` routes E_J through the frozen product RI-J aux (γ pair-sharded, metric
-    solve replicated); ``gamma_chunk`` is that stream's pair chunk, and it sets the step's PEAK
-    MEMORY — the per-chunk temporaries are (N_aux, chunk) and (N_aux, chunk, 3). ``hartree="exact"`` is the density-fitting-FREE path: the EXACT streamed ERI with the
+    ``hartree="df"`` routes E_J through the frozen product RI-J aux (γ pair-sharded, the metric
+    factor ``cholV`` row-sharded: :func:`~gs_dft.coulomb.ri.metric_factor` with ``G``). ``gamma_chunk``
+    is that stream's pair chunk over the WHOLE mesh: each device takes ⌈gamma_chunk/G⌉ pairs a chunk,
+    so its working set, (aux tile, chunk/G) per node kernel, falls as devices are added. ``hartree="exact"`` is the density-fitting-FREE path: the EXACT streamed ERI with the
     bra pairs sharded (this device's slice) and the ket pairs ALL-GATHERED, each device contributing
     ½ Σ_{a∈slice} Jvec_a P_a and the partial E_J psum'd — O(M) memory / O(M²) compute, no aux, no
     O(N_aux³) metric. Differentiable in (basis, C_orth); equals the single-device screened energy to
@@ -194,10 +196,20 @@ def sharded_screened_energy(basis, C, occ, aux, coords, charges, pairs, gp, gw, 
     # indexes into — each device then holds the cells for its own contiguous grid slice, with
     # point indices already local to that slice.
     cells_spec = tuple((P("g"),) * 4 for _ in (cells or ()))
+    # The metric factor's rows are dealt over the devices too (padded to whole solve blocks).
+    factor = () if cholV is None else (cholV,)
+    G = int(mesh.size)
+
+    # Every streamed term's working set is a budget for the WHOLE mesh, split over the devices:
+    # each device's chunks are 1/G of one device's, so its peak falls as devices are added (a
+    # device walks the same number of chunks, each smaller).
+    row_budget, cell_budget = _PAIR_BUDGET // G, CHUNK_BYTES // G
+    ext_chunk, gamma_chunk_dev = -(-EXT_CHUNK // G), -(-int(gamma_chunk) // G)
 
     @partial(shard_map, mesh=mesh, check_vma=False, out_specs=(P(),) * 6,
-             in_specs=(P(), P(), grid_spec, pairs_spec, cells_spec, rows_spec))
-    def _energy(basis, Craw, grid, pairs, cells_, rows_):
+             in_specs=(P(), P(), grid_spec, pairs_spec, cells_spec, rows_spec,
+                       tuple(P("g") for _ in factor)))
+    def _energy(basis, Craw, grid, pairs, cells_, rows_, factor_):
         # Returns (E_total, E_kin, E_ext, E_hartree, E_xc, nelec) — replicated scalars (psum'd).
         gp_, gw_ = grid                                         # this device's grid-point slice
         pi, pj, vm = pairs                                      # this device's pair slice
@@ -205,22 +217,24 @@ def sharded_screened_energy(basis, C, occ, aux, coords, charges, pairs, gp, gw, 
         # One-electron path, sharded by rows: partial Grams psum'd, retraction replicated.
         rmask = rok.astype(Craw.dtype)[:, None]
         Cr = Craw[ridx] * rmask
-        gram = lax.psum(Cr.T @ overlap_times_rows(basis, Craw, ridx), "g")        # (n_occ, n_occ)
+        gram = lax.psum(Cr.T @ overlap_times_rows(basis, Craw, ridx, row_budget), "g")   # (n_occ, n_occ)
         C = Craw @ _lowdin_transform(gram)                                          # Löwdin, replicated
-        Ekin = lax.psum(occ @ jnp.sum((C[ridx] * rmask) * kinetic_times_rows(basis, C, ridx), axis=0), "g")
+        Ekin = lax.psum(occ @ jnp.sum((C[ridx] * rmask) * kinetic_times_rows(basis, C, ridx, row_budget),
+                                      axis=0), "g")
         # XC on this device's grid slice. Block-sparse cells when built (6.2× on the density term
         # at ala_15), else the 2a chunked dense path (remat internal → O(grid_chunk·M) memory).
         # shard_map leaves a length-1 device axis on each cell array; drop it to get this device's
         # own cells, whose point indices are already local to `gp_`.
         if cells_:
             local = tuple((a[0], b[0], c[0], d[0]) for a, b, c, d in cells_)
-            rho, grad = cell_density_and_grad(basis, C, occ, gp_, local)
+            rho, grad = cell_density_and_grad(basis, C, occ, gp_, local, budget=cell_budget)
         else:
             rho, grad = chunked_density_and_grad(basis, C, occ, gp_, chunk=grid_chunk)
         rho_c = jnp.maximum(rho, 1e-30)
         Exc = xc_energy(xc, rho_c, gw_, grad_rho=grad if gga else None)
         nel_part = jnp.dot(gw_, rho_c)                          # integrated electron count (this slice)
-        ex = screened_external_energy(basis, C, occ, pi, pj, coords, charges, vm, skip_pad=skip_pad)
+        ex = screened_external_energy(basis, C, occ, pi, pj, coords, charges, vm, chunk=ext_chunk,
+                                      skip_pad=skip_pad)
         Enn = nuclear_repulsion(coords, charges)               # replicated constant
         if hartree == "exact":                                 # DF-FREE exact streamed ERI
             pif = lax.all_gather(pi, "g", tiled=True)           # full ket pair list on EVERY device
@@ -237,12 +251,13 @@ def sharded_screened_energy(basis, C, occ, aux, coords, charges, pairs, gp, gw, 
             Exc, ex, nel, Ej = lax.psum((Exc, ex, nel_part, Ej_part), "g")
             return Ekin + ex + Ej + Exc + Enn, Ekin, ex, Ej, Exc, nel
         gamma = df_coulomb_gamma_screened(basis, C, occ, aux, pi, pj, valid=vm, skip_pad=skip_pad,
-                                          chunk=gamma_chunk)
+                                          chunk=gamma_chunk_dev)
         Exc, ex, nel, gamma = lax.psum((Exc, ex, nel_part, gamma), "g")
-        Ej = df_coulomb_solve(gamma, aux, lam=lam, cholV=cholV)  # replicated metric tail
+        Ej = (df_coulomb_solve_rows(gamma, factor_[0], "g") if factor_
+              else df_coulomb_solve(gamma, aux, lam=lam))   # no factor: the replicated dense solve
         return Ekin + ex + Ej + Exc + Enn, Ekin, ex, Ej, Exc, nel
 
-    return _energy(basis, C, (gp, gw), pairs, tuple(cells or ()), rows)
+    return _energy(basis, C, (gp, gw), pairs, tuple(cells or ()), rows, factor)
 
 
 def sharded_hf_energy(basis, C, occ, coords, charges, pairs, *, mesh, rows, skip_pad=False):

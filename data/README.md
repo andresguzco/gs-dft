@@ -4,7 +4,8 @@ The data behind every figure and table of the paper, as CSV.
 
 ## `figures/`
 
-The inputs of the six figures. `make figures` rebuilds all of them from these files alone.
+The inputs of the submitted paper's six figures; `rebuttal/` holds the rest. `make figures` rebuilds
+all of them from these two folders alone.
 
 | File | Figure | Contents |
 |---|---|---|
@@ -31,6 +32,19 @@ The run files (`fig2`–`fig5`) hold one row per recorded result, with a column 
 
 `experiments.common.results.iter_results` and `read_records` read these files, and `write_csv`
 converts the logs of new runs to the same format.
+
+## `rebuttal/`
+
+The accuracy scaling on the new systems (Figures 5 and 6, Appendix F) and the parallel efficiency
+(Appendix F). `accuracy.csv` is a run file in the format above.
+
+| File | Contents |
+|---|---|
+| `accuracy.csv` | the splat ladders (`kind=splat`) and Gaussian ladders (`kind=gto`) of the new systems; GPU4PySCF references have `mode=g4p_direct` and are shifted onto the `dftax` scale by `offset_mha` |
+| `offsets.csv` | the `dftax` − GPU4PySCF energy offset per system, at the bases both codes ran |
+| `exp2_scaling.csv` | step time (s; median, 10th and 90th percentiles) against the number of GPUs `G`, with repeats `rep` |
+| `exp2_memory.csv` | peak memory per GPU (MB, one value per GPU separated by `/`) against `G` |
+| `exp4.csv` | GPU4PySCF density fitting against direct SCF on cyclosporin A at cc-pVTZ |
 
 ## `tables/`
 

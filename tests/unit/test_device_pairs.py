@@ -1,7 +1,7 @@
 """``neighbor_pairs``, the on-device significant-pair build, against a dense reference.
 
 Checks which pairs are kept, their order (which decides the device split under ``shard_map``), and
-that padding stays at the tail when the capacity overflows.
+that padding stays at the tail, and that a pad overflow raises.
 """
 import re
 
@@ -73,19 +73,14 @@ def test_padding_goes_to_the_tail_and_is_masked():
     assert (np.asarray(pi)[n:] == 0).all() and (np.asarray(pj)[n:] == 0).all()
 
 
-def test_overflow_keeps_the_largest_overlaps():
-    """With pad_to below the significant count the build must keep the strongest pairs — dropping
-    the marginal ~eps tail — rather than raising, so the trainer's shapes stay constant."""
+def test_overflow_raises():
+    """With pad_to below the significant count the build raises rather than dropping pairs."""
+    from gs_dft.screening.pairs import PairPadOverflow
     model = init_model(_mol(), 48, jr.PRNGKey(1), init=chem())
     eps, M = 1e-7, 48
-    S = _dense_reference(model.basis, M)
-    n = int((S > eps).sum())
-    pad_to = n // 2
-    pi, pj, valid = neighbor_pairs(model.basis, eps=eps, pad_to=pad_to)
-    assert pi.shape[0] == pad_to and bool(np.all(np.asarray(valid)))
-    kept = S[np.asarray(pi), np.asarray(pj)]
-    dropped_max = np.sort(S[S > eps])[::-1][pad_to:].max()
-    assert kept.min() >= dropped_max, "a dropped pair outranked a kept one"
+    n = int((_dense_reference(model.basis, M) > eps).sum())
+    with pytest.raises(PairPadOverflow):
+        neighbor_pairs(model.basis, eps=eps, pad_to=n // 2)
 
 
 def test_pad_larger_than_the_pair_count_is_padded_not_truncated():

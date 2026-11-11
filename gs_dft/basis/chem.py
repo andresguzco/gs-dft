@@ -126,7 +126,7 @@ def _largest_remainder(weights: np.ndarray, total: int) -> np.ndarray:
     floor = np.floor(exact).astype(int)
     rem = int(total - floor.sum())
     if rem > 0:
-        for idx in np.argsort(-(exact - floor))[:rem]:
+        for idx in np.argsort(-(exact - floor), kind="stable")[:rem]:   # ties: the lower index, on any CPU
             floor[idx] += 1
     return floor
 

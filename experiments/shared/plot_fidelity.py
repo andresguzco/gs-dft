@@ -24,11 +24,10 @@ import numpy as np
 from experiments.common import resources, systems
 from experiments.common.results import iter_results
 from experiments.common import cbs as _cbs
-from experiments.common.style import (apply as apply_style, PAPER_FIG_HEIGHT_IN,
-                                       save_at_height)
+from experiments.common.style import apply as apply_style, save_at_height
 
 REL_W = 1.0
-FIG_H = PAPER_FIG_HEIGHT_IN * 1.00
+FIG_H = 1.5          # inches: the height of Figure 6
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXP3 = os.path.join(HERE, "..", "..", "data", "figures", "fig4_dissociation.csv")

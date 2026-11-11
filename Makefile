@@ -14,7 +14,8 @@ FIGS = \
   ablation:experiments.exp1_ablation_ladder.plot_ablation \
   observables:experiments.shared.plot_observables \
   fidelity:experiments.shared.plot_fidelity \
-  isoparams:experiments.shared.plot_isoparams
+  isoparams:experiments.shared.plot_isoparams \
+  rebuttal:experiments.rebuttal.figures
 
 .PHONY: figures test
 

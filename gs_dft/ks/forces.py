@@ -142,12 +142,14 @@ def df_on_graph_energy(ks, state):
     """``E(model)`` for a DF ``ks`` with the pair-product aux rebuilt from the splats INSIDE the
     energy, so the aux dependence is differentiated. Metric factored per call (fine up to ~1e4 aux)."""
     from gs_dft.basis.isotropic import init_product_aux
-    from gs_dft.coulomb.ri import aux_metric, shift_diag
+    from gs_dft.coulomb.ri import aux_metric, shift_diag, pad_factor, factor_rows
     term = ks.coulomb
 
     def energy(model):
         aux = init_product_aux(model.basis, scales=term.scales, diagonal_only=term.diagonal)
         cholV = jax.scipy.linalg.cholesky(shift_diag(aux_metric(aux), term.lam), lower=True)
+        if ks.mesh is not None:                    # the mesh's row-dealt layout (ri.metric_factor)
+            cholV = pad_factor(cholV, factor_rows(cholV.shape[0], int(ks.mesh.size)))
         st = eqx.tree_at(lambda s: (s.aux, s.cholV), state, (aux, cholV),
                          is_leaf=lambda x: x is None)
         if term.hf_coeff != 0.0:

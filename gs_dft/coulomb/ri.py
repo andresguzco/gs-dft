@@ -47,6 +47,7 @@ __all__ = [
     "df_coulomb_energy", "build_three_center", "df_exchange_energy",
     "df_exchange_energy_density",
     "df_coulomb_energy_screened", "df_exchange_energy_screened",
+    "metric_factor", "df_coulomb_solve_rows",
 ]
 
 _I3 = np.eye(3)          # numpy: importing the package must not initialise the JAX backend
@@ -153,7 +154,8 @@ def full_isobra_block(beta, R_aux, KN_aux, A_pair, P_pair, KN_pair, omega=None):
 
 @functools.lru_cache(maxsize=8)
 def _make_isobra_nodes(t_list, w_list):
-    """Build the node kernel for ONE quadrature table, with its analytic reverse.
+    """Build the node kernel for ONE quadrature table, with its analytic reverse; returns the
+    ``custom_vjp`` node sum and the one-loop ``value_and_reverse`` the RI-J stream's reverse uses.
 
     A factory because range separation changes only the quadrature table: the short-range kernel
     integrates t over [0,∞) and the long-range one over [0,ω], with identical Γ algebra and
@@ -167,72 +169,85 @@ def _make_isobra_nodes(t_list, w_list):
     def nodes(beta, dp2, Lam):
         """Σ_t w_t (Γ₀Γ₁Γ₂)^{-1/2} exp(−t² Σ_k W_k/Γ_k), Γ_k = βΛ_k + t²(β+Λ_k), W_k = βΛ_k dp2_k.
 
-        Static python unroll (one fused kernel; Γ built in-register from the small per-side
-        arrays — only dp2 (A,B,3) is big) + analytic backward below (no per-node tape)."""
+        Static unroll (one fused kernel), no float64 division: 1/(Γ₀Γ₁Γ₂) is the square of the
+        rsqrt the integrand takes anyway."""
         b = beta[:, None]                                      # (A,1)
-        L0, L1, L2 = Lam[None, :, 0], Lam[None, :, 1], Lam[None, :, 2]    # (1,B)
+        Ls = (Lam[None, :, 0], Lam[None, :, 1], Lam[None, :, 2])    # (1,B)
+        bL = [b * L for L in Ls]
+        bpL = [b + L for L in Ls]
+        W = [bL[k] * dp2[..., k] for k in range(3)]            # node-independent
         coul = jnp.zeros((beta.shape[0], Lam.shape[0]))
         for t, w in zip(t_list, w_list):                       # static unroll → one fused kernel
             t2 = t * t
-            G0 = b * L0 + t2 * (b + L0)                        # Γ_k
-            G1 = b * L1 + t2 * (b + L1)
-            G2 = b * L2 + t2 * (b + L2)
-            invp = 1.0 / (G0 * G1 * G2)                        # ONE division per (A,B)
-            num = b * (L0 * dp2[..., 0] * G1 * G2
-                       + L1 * dp2[..., 1] * G0 * G2
-                       + L2 * dp2[..., 2] * G0 * G1)
-            coul = coul + w * jnp.sqrt(invp) * jnp.exp(-t2 * num * invp)
+            G0, G1, G2 = (bL[k] + t2 * bpL[k] for k in range(3))
+            r = lax.rsqrt(G0 * G1 * G2)
+            num = W[0] * (G1 * G2) + W[1] * (G0 * G2) + W[2] * (G0 * G1)
+            coul = coul + w * r * jnp.exp(-t2 * num * (r * r))
         return coul
 
     def nodes_fwd(beta, dp2, Lam):
         return nodes(beta, dp2, Lam), (beta, dp2, Lam)
 
-    def nodes_bwd(res, gI):
-        """Analytic reverse: with I_t = w P^{-1/2} e^{−t²S}, P = ∏Γ_k, S = ΣW_k/Γ_k,
-            ∂I/∂Γ_k = I·(−½ + t² W_k/Γ_k)/Γ_k ,   ∂I/∂W_k = −I·t²/Γ_k ,
+    def value_and_reverse(beta, dp2, Lam, gI):
+        """The node sum and its reverse for the cotangent gI, in one loop:
+        ``(coul, d_beta, d_dp2, d_Lam)``. With I_t = w P^{-1/2} e^{−t²S}, P = ∏Γ_k, S = ΣW_k/Γ_k,
+            ∂I/∂Γ_k = I·(t² W_k/Γ_k − ½)/Γ_k ,   ∂I/∂W_k = −I·t²/Γ_k ,
             Γ_k → (β: Λ_k+t², Λ_k: β+t²),  W_k = βΛ_k dp2_k → (β: Λ_k dp2_k, Λ_k: β dp2_k,
-            dp2_k: βΛ_k). One fused unrolled loop, cotangents reduced on the fly.
+            dp2_k: βΛ_k).
+        The node sums Σ I, Σ∂I/∂Γ_k, Σt²∂I/∂Γ_k and Σt²I/Γ_k are ONE variadic reduction over a
+        trailing node axis (division-free: 1/Γ_k = Γ_iΓ_j/P), so the exp per node is evaluated once
+        inside a single row-reduction kernel: 1.0 ms on an 832x512 block against 5.0 ms for the
+        unrolled loop, which XLA cut into ~25 kernels (experiments/kernels/node_bench.py). gI and
+        the chain to (β, Λ, dp2) are applied once after it, and each output is reduced once.
 
         The table enters only through t and w, never through a derivative, so the same reverse
         serves both ranges."""
-        beta, dp2, Lam = res
+        t2 = jnp.asarray(t_list) ** 2                          # (Q,), the trailing node axis
+        w = jnp.asarray(w_list)
         b = beta[:, None]
         Ls = (Lam[None, :, 0], Lam[None, :, 1], Lam[None, :, 2])
-        d_beta = jnp.zeros_like(b)                             # (A,1) — reduce over B at the end
-        d_Lam = [jnp.zeros((1, Lam.shape[0]))] * 3             # (1,B) each — reduce over A
-        d_dp2 = [jnp.zeros((beta.shape[0], Lam.shape[0]))] * 3
-        for t, w in zip(t_list, w_list):
-            t2 = t * t
-            G = [b * L + t2 * (b + L) for L in Ls]             # Γ_k, in-register
-            invG = [1.0 / Gk for Gk in G]
-            W = [b * L * dp2[..., k] for k, L in enumerate(Ls)]
-            S = W[0] * invG[0] + W[1] * invG[1] + W[2] * invG[2]
-            I = w * jnp.sqrt(invG[0] * invG[1] * invG[2]) * jnp.exp(-t2 * S)
-            gIt = gI * I                                       # upstream × node value
-            db = jnp.zeros_like(gIt)
-            for k, L in enumerate(Ls):
-                dIdG = gIt * (t2 * W[k] * invG[k] - 0.5) * invG[k]      # ∂I/∂Γ_k · gI
-                dIdW = -gIt * t2 * invG[k]                              # ∂I/∂W_k · gI
-                db = db + dIdG * (L + t2) + dIdW * L * dp2[..., k]
-                d_Lam[k] = d_Lam[k] + jnp.sum(dIdG * (b + t2) + dIdW * b * dp2[..., k],
-                                              axis=0, keepdims=True)
-                d_dp2[k] = d_dp2[k] + dIdW * b * L
-            d_beta = d_beta + jnp.sum(db, axis=1, keepdims=True)
-        return (d_beta[:, 0], jnp.stack(d_dp2, axis=-1),
-                jnp.stack([dL[0] for dL in d_Lam], axis=-1))
+        bL = [b * L for L in Ls]
+        W = [bL[k] * dp2[..., k] for k in range(3)]
+        G = [(b * L)[..., None] + t2 * (b + L)[..., None] for L in Ls]    # (A,B,Q)
+        r = lax.rsqrt(G[0] * G[1] * G[2])
+        r2 = r * r
+        invG = (G[1] * G[2] * r2, G[0] * G[2] * r2, G[0] * G[1] * r2)
+        I = w * r * jnp.exp(-t2 * (W[0][..., None] * invG[0] + W[1][..., None] * invG[1]
+                                   + W[2][..., None] * invG[2]))
+        terms = [I]
+        for k in range(3):
+            c = t2 * (I * invG[k])                             # t² I/Γ_k
+            dG = c * W[k][..., None] * invG[k] - 0.5 * (I * invG[k])    # ∂I/∂Γ_k
+            terms += [dG, t2 * dG, c]
+        sums = lax.reduce(tuple(terms), tuple(jnp.zeros((), I.dtype) for _ in terms),
+                          lambda a, c: tuple(x + y for x, y in zip(a, c)), (2,))
+        coul, hG, hGt, hW = sums[0], sums[1::3], sums[2::3], sums[3::3]
+        d_beta = 0.0
+        d_Lam, d_dp2 = [], []
+        for k, L in enumerate(Ls):
+            x = dp2[..., k]
+            d_beta = d_beta + L * hG[k] + hGt[k] - hW[k] * (L * x)
+            d_Lam.append(jnp.sum(gI * (b * hG[k] + hGt[k] - hW[k] * (b * x)), axis=0))
+            d_dp2.append(-gI * hW[k] * bL[k])
+        return (coul, jnp.sum(gI * d_beta, axis=1), jnp.stack(d_dp2, axis=-1),
+                jnp.stack(d_Lam, axis=-1))
+
+    def nodes_bwd(res, gI):
+        return value_and_reverse(*res, gI)[1:]
 
     nodes.defvjp(nodes_fwd, nodes_bwd)
-    return nodes
+    return nodes, value_and_reverse
 
 
-_isobra_nodes = _make_isobra_nodes(tuple(_QUAD_T_LIST), tuple(_QUAD_W_LIST))
+_isobra_nodes, _isobra_value_and_reverse = _make_isobra_nodes(tuple(_QUAD_T_LIST),
+                                                              tuple(_QUAD_W_LIST))
 
 
 @functools.lru_cache(maxsize=8)
 def _lr_nodes(omega: float, n_quad: int = 12):
     """The node kernel for erf(ωr)/r — the same kernel on the segment table [0, ω]."""
     t, w = _gauss_legendre_segment(float(omega), int(n_quad))
-    return _make_isobra_nodes(tuple(float(x) for x in t), tuple(float(x) for x in w))
+    return _make_isobra_nodes(tuple(float(x) for x in t), tuple(float(x) for x in w))[0]
 
 
 def aux_quantities(aux):
@@ -256,12 +271,20 @@ def _chol_donated(V):
     return jax.scipy.linalg.cholesky(V, lower=True)
 
 
+@functools.partial(jax.jit, static_argnames=("omega",))
+def _shifted_metric(b, R, n, lam, omega=None):
+    """V + lam·I in one compiled unit, so the shift lands in V's buffer instead of a copy of it."""
+    return shift_diag(coulomb_block(b, R, n, b, R, n, omega=omega), lam)
+
+
 def aux_cholesky(aux, lam, omega=None):
     """Lower Cholesky factor of ``(V + lam·I)``.
 
-    The factorization donates its input, so V never escapes and no dense identity is built.
+    V is built and shifted in one compiled unit and the factorization donates it, so one N_aux²
+    buffer serves all three, and no dense identity is built.
     """
-    return _chol_donated(shift_diag(aux_metric(aux, omega=omega), lam))
+    b, R, n = aux_quantities(aux)
+    return _chol_donated(_shifted_metric(b, R, n, lam, omega=omega))
 
 
 def aux_metric(aux, omega=None):
@@ -433,40 +456,157 @@ def df_exchange_energy(splats, C_occ, aux, lam=1e-8, chunk=64, occ_chunk=16, ome
 #  ``pi, pj`` = ALL ordered significant pairs (from ``screening.neighbor_pairs``); ``valid`` masks
 #  the static-shape padding. The aux metric V is unchanged (the aux is dense/global).
 # ---------------------------------------------------------------------------
+_ISOBRA_PREF = 2.0 * np.pi ** 2.5          # π³ · 2/√π, as in full_isobra_block
+
+
+_AUX_TILE = 2048
+"""Aux functions per tile of the γ stream's node kernels: each pair chunk is swept over the aux in
+tiles of this many rows, so the working set is (tile, chunk), not (N_aux, chunk). Without the tile,
+XLA lays the reverse's node axis out in memory at large N_aux: nine (N_aux, chunk, 64) arrays, 46 GiB
+per device at insulin (N_aux 21,026, chunk 512) whatever the device count. Tiled, the same
+kernels also run faster (experiments/kernels/node_bench.py)."""
+
+
+def _pair_geometry(splat_q, Ci, Cj, occ, ci, cj, cv):
+    """The pair half of the γ geometry for one chunk: Λ and U (Â_ij = UΛUᵀ), the product centre P
+    and h = w·P_ij·N_iN_jK. Takes the chunk's coefficient rows ``Ci = C[ci]``, ``Cj = C[cj]``, so the
+    reverse adds their cotangents into its running (M, n_occ) total in place, instead of making a
+    dense (M, n_occ) cotangent per chunk."""
+    Aij, Pa, KN = _full_pair_quantities(splat_q, ci, cj)
+    Lam, U = jnp.linalg.eigh(Aij)
+    h = cv.astype(Ci.dtype) * jnp.sum(occ[None, :] * Ci * Cj, axis=1) * KN
+    return Lam, U, Pa, h
+
+
+def _rotated_offsets(R, U, Pa):
+    """dp2 = (Uᵀ(R − P))², (tile, chunk, 3): an aux tile against a pair chunk."""
+    return jnp.einsum("bki,abk->abi", U, R[:, None, :] - Pa[None, :, :]) ** 2
+
+
+def _aux_tiles(aux_q, tile):
+    """(β, R, KN) padded to whole tiles, as (n_tile, tile, ...). A pad row has KN = 0 (and β = 1,
+    R = 0, so its kernels stay finite): it adds nothing to γ and draws no cotangent."""
+    beta, R, KN = aux_q
+    A = beta.shape[0]
+    t = int(min(tile, A))
+    pad = (-A) % t
+    cut = lambda x, v: jnp.concatenate([x, jnp.full((pad,) + x.shape[1:], v, x.dtype)]).reshape(
+        (-1, t) + x.shape[1:])
+    return cut(beta, 1.0), cut(R, 0.0), cut(KN, 0.0)
+
+
+def _live_update(fn, acc, cv, skip_pad):
+    """``fn(acc)``, or ``acc`` unchanged for an all-padding chunk when ``skip_pad``: the running
+    total goes through the cond, so a live chunk updates it in place."""
+    if skip_pad:
+        return lax.cond(jnp.any(cv != 0), fn, lambda a: a, acc)
+    return fn(acc)
+
+
+def _live(fn, zero, cv, skip_pad):
+    """``fn()``, or ``zero`` for an all-padding chunk when ``skip_pad`` (the pad is appended).
+    Never differentiated through (the streams carry their own VJP), so the cond costs no memory."""
+    if skip_pad:
+        return lax.cond(jnp.any(cv != 0), fn, lambda: zero)
+    return fn()
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(7, 8))
+def _gamma_stream(aux_q, splat_q, C_occ, occ, pi, pj, valid, chunk, skip_pad):
+    """γ = Σ_chunks (P|a) h_a, each chunk swept over the aux in tiles of ``_AUX_TILE`` rows. The
+    reverse is one pass over the chunks too (no tape, no remat): per chunk the pair geometry's VJP,
+    and per tile one node loop that makes the value and its reverse together."""
+    pic, pjc, vc = _pair_chunks(pi, pj, valid, chunk)
+    tiles = _aux_tiles(aux_q, _AUX_TILE)
+    A = aux_q[0].shape[0]
+    zero = jnp.zeros(tiles[0].size)
+
+    def body(acc, c):
+        ci, cj, cv = c
+
+        def fn():
+            Lam, U, Pa, h = _pair_geometry(splat_q, C_occ[ci], C_occ[cj], occ, ci, cj, cv)
+            return lax.map(lambda t: _ISOBRA_PREF * t[2] * (
+                _isobra_nodes(t[0], _rotated_offsets(t[1], U, Pa), Lam) @ h), tiles).reshape(-1)
+
+        return acc + _live(fn, zero, cv, skip_pad), None
+
+    return lax.scan(body, zero, (pic, pjc, vc))[0][:A]
+
+
+def _gamma_stream_fwd(aux_q, splat_q, C_occ, occ, pi, pj, valid, chunk, skip_pad):
+    out = _gamma_stream(aux_q, splat_q, C_occ, occ, pi, pj, valid, chunk, skip_pad)
+    return out, (aux_q, splat_q, C_occ, occ, pi, pj, valid)
+
+
+def _gamma_stream_bwd(chunk, skip_pad, res, gbar):
+    aux_q, splat_q, C_occ, occ, pi, pj, valid = res
+    pic, pjc, vc = _pair_chunks(pi, pj, valid, chunk)
+    tiles = _aux_tiles(aux_q, _AUX_TILE)
+    A = aux_q[0].shape[0]
+    gtile = jnp.concatenate([gbar, jnp.zeros(tiles[0].size - A, gbar.dtype)]).reshape(tiles[0].shape)
+    z = lambda x: jnp.zeros(jnp.shape(x), jnp.result_type(x))   # zeros_like would carry a mesh sharding into shard_map
+    zero = jax.tree.map(z, (tiles, splat_q, C_occ, occ))
+
+    def body(acc, c):
+        ci, cj, cv = c
+
+        def fn(acc):
+            (Lam, U, Pa, h), pvjp = jax.vjp(
+                lambda s, a, b, o: _pair_geometry(s, a, b, o, ci, cj, cv),
+                splat_q, C_occ[ci], C_occ[cj], occ)
+
+            def tile(pair_ct, t):
+                beta, R, KN, gb = t
+                dp2, ovjp = jax.vjp(_rotated_offsets, R, U, Pa)
+                u = _ISOBRA_PREF * gb * KN                                   # (tile,)
+                coul, d_beta, d_dp2, d_Lam = _isobra_value_and_reverse(beta, dp2, Lam,
+                                                                       u[:, None] * h[None, :])
+                d_R, d_U, d_Pa = ovjp(d_dp2)
+                pair_ct = jax.tree.map(jnp.add, pair_ct, (d_Lam, d_U, d_Pa, u @ coul))
+                return pair_ct, (d_beta, d_R, _ISOBRA_PREF * gb * (coul @ h))
+
+            pair_ct, aux_ct = lax.scan(tile, jax.tree.map(z, (Lam, U, Pa, h)), (*tiles, gtile))
+            d_s, d_Ci, d_Cj, d_o = pvjp(pair_ct)
+            a_aux, a_s, a_C, a_o = acc
+            return (jax.tree.map(jnp.add, a_aux, aux_ct), jax.tree.map(jnp.add, a_s, d_s),
+                    a_C.at[ci].add(d_Ci).at[cj].add(d_Cj), a_o + d_o)
+
+        return _live_update(fn, acc, cv, skip_pad), None
+
+    (d_beta, d_R, d_KN), d_s, d_C, d_o = lax.scan(body, zero, (pic, pjc, vc))[0]
+    flat = lambda x: x.reshape((-1,) + x.shape[2:])[:A]
+    return ((flat(d_beta), flat(d_R), flat(d_KN)), d_s, d_C, d_o, None, None, None)
+
+
+_gamma_stream.defvjp(_gamma_stream_fwd, _gamma_stream_bwd)
+
+
+def _pair_chunks(pi, pj, valid, chunk):
+    """The pair list padded to a multiple of ``chunk`` (dummy (0,0), weight 0), as (n_chunk, chunk)."""
+    n = pi.shape[0]
+    pad = (-n) % chunk
+    v = jnp.ones(n, bool) if valid is None else valid
+    return (jnp.concatenate([pi, jnp.zeros(pad, pi.dtype)]).reshape(-1, chunk),
+            jnp.concatenate([pj, jnp.zeros(pad, pj.dtype)]).reshape(-1, chunk),
+            jnp.concatenate([v, jnp.zeros(pad, v.dtype)]).reshape(-1, chunk))
+
+
 def df_coulomb_gamma_screened(splats, C_occ, occ, aux, pi, pj, chunk=2048, valid=None,
                               skip_pad=False):
-    """γ_P = Σ_a (P|a) q_a over the significant bra-pairs (q_a = Σ_o occ_o C_io C_jo, formed per
-    chunk inside the stream so the (n_pair, n_occ) tape never materializes). This is the
+    """γ_P = Σ_a (P|a) q_a over the significant bra-pairs (q_a = w_a Σ_o occ_o C_io C_jo, formed per
+    chunk inside the stream so the (n_pair, n_occ) array never materializes). This is the
     PAIR-LINEAR half of ``df_coulomb_energy_screened`` — a plain sum over pairs, so it shards
     across devices by splitting (pi,pj,valid) + one ``psum``; the metric solve
-    (``df_coulomb_solve``) is the small replicated tail. Returns γ (N_aux,)."""
-    aux_q = aux_quantities(aux)
-    splat_q = full_quantities(splats)                       # A-chart hoisted out of the stream
-    N_aux = aux_q[0].shape[0]
-    chunk = min(chunk, pi.shape[0])
-    Npair = pi.shape[0]
-    pad = (-Npair) % chunk
-    base_valid = jnp.ones(Npair, bool) if valid is None else valid
-    pic = jnp.concatenate([pi, jnp.zeros(pad, pi.dtype)]).reshape(-1, chunk)
-    pjc = jnp.concatenate([pj, jnp.zeros(pad, pj.dtype)]).reshape(-1, chunk)
-    vc = jnp.concatenate([base_valid, jnp.zeros(pad, bool)]).reshape(-1, chunk)
+    (``df_coulomb_solve``) is the small replicated tail. ``valid``: a bool mask (0/1) or unique-pair
+    weights (0/1/2) — see screening.neighbor_pairs. Returns γ (N_aux,).
 
-    def chunk_gamma(ci, cj, cv):
-        # cv: bool mask (0/1) or unique-pair weights (0/1/2) — see screening.neighbor_pairs
-        q = cv.astype(C_occ.dtype) * jnp.sum(occ[None, :] * C_occ[ci] * C_occ[cj], axis=1)   # (chunk,)
-        block = full_isobra_block(*aux_q, *_full_pair_quantities(splat_q, ci, cj))      # (N_aux, chunk)
-        return block @ q
-
-    def body(acc, carry):
-        ci, cj, cv = carry
-        if skip_pad:                       # appended padding ⇒ trailing chunks are all-dummy
-            g = lax.cond(jnp.any(cv != 0), chunk_gamma, lambda *_: jnp.zeros(N_aux), ci, cj, cv)
-        else:
-            g = chunk_gamma(ci, cj, cv)
-        return acc + g, None
-
-    gamma, _ = lax.scan(jax.checkpoint(body), jnp.zeros(N_aux), (pic, pjc, vc))
-    return gamma
+    Streamed with its own VJP (``_gamma_stream``): the reverse is one more pass over the chunks,
+    so memory stays at one chunk with or without ``skip_pad``."""
+    if valid is None:
+        valid = jnp.ones(pi.shape[0], bool)
+    return _gamma_stream(aux_quantities(aux), full_quantities(splats), C_occ, occ, pi, pj, valid,
+                         int(min(chunk, max(1, pi.shape[0]))), bool(skip_pad))
 
 
 def df_coulomb_solve(gamma, aux, lam=1e-8, cholV=None):
@@ -480,6 +620,187 @@ def df_coulomb_solve(gamma, aux, lam=1e-8, cholV=None):
     V = aux_metric(aux)
     d = jnp.linalg.solve(shift_diag(V, lam), gamma)
     return 0.5 * jnp.dot(gamma, d)
+
+
+SOLVE_BLOCK = 256
+"""Rows per block of the mesh's metric solves (:func:`df_coulomb_solve_rows`). The factor is padded to
+whole blocks on every device, so a smaller block wastes fewer rows and takes more sequential steps."""
+
+
+def factor_rows(n, G):
+    """Rows of the metric factor as a mesh of ``G`` devices holds it: ``n`` padded to whole
+    :data:`SOLVE_BLOCK` blocks on every device."""
+    q = SOLVE_BLOCK * int(G)
+    return -(-int(n) // q) * q
+
+
+@functools.partial(jax.jit, static_argnums=1)
+def pad_factor(L, n):
+    """``[[L, 0], [0, I]]`` of size ``n``: the pad's identity rows solve to zero against a zero
+    right-hand side, so they change nothing."""
+    N = L.shape[0]
+    i = jnp.arange(N, n)
+    return jnp.pad(L, ((0, n - N), (0, n - N))).at[i, i].set(1.0)
+
+
+def metric_factor(aux, lam, mesh=None):
+    """The lower Cholesky factor of ``(V + λI)`` as the step reads it: whole on one device (``mesh``
+    None, :func:`df_coulomb_solve`), or on a mesh padded to :func:`factor_rows` and built and factored
+    by contiguous row blocks across its devices (:func:`_factor_rows`), each holding only its own
+    rows (:func:`df_coulomb_solve_rows`).
+
+    The pad: null aux functions (norm 0), whose metric rows vanish, so V + λI is block diagonal with
+    a λI tail and factors into ``[[L, 0], [0, √λ I]]``; the pad's right-hand side is zero, so it
+    solves to zero."""
+    if mesh is None:
+        return aux_cholesky(aux, lam)
+    b, R, n = aux_quantities(aux)
+    p = factor_rows(b.shape[0], int(mesh.size)) - b.shape[0]
+    pad = lambda x, v: jnp.concatenate([x, jnp.full((p,) + x.shape[1:], v, x.dtype)])
+    q = (pad(b, 1.0), pad(R, 0.0), pad(n, 0.0))
+    from jax.sharding import NamedSharding, PartitionSpec
+    if jax.process_count() > 1:                 # multi-node: the inputs as global replicated arrays
+        from jax.experimental.multihost_utils import host_local_array_to_global_array
+        q = host_local_array_to_global_array(q, mesh, PartitionSpec())
+    else:                                       # the refresh builds the aux on one device
+        q = jax.device_put(q, NamedSharding(mesh, PartitionSpec()))
+    return _factor_rows(*q, jnp.asarray(lam, q[0].dtype), mesh=mesh)
+
+
+FACTOR_PHASES = 8
+"""Fixed column windows of :func:`_factor_rows`: block columns are split into this many phases, and
+every update in a phase spans the columns past the phase's first panel (fixed shape, one compile)."""
+
+
+@functools.partial(jax.jit, static_argnames=("mesh",))
+def _factor_rows(b, R, n, lam, mesh):
+    """V + λI built and Cholesky-factored by contiguous row blocks over ``mesh`` (axis "g"): the
+    right-looking blocked factorization of MAGMA's multi-GPU ``potrf_mgpu``, in one dimension. Per
+    block column k: the owner's diagonal block is summed to every device and factored there; each
+    device solves its rows of the panel; the panel is gathered; each device updates its own rows
+    past it, a row slab at a time. A device holds its rows of V (in place), the panel and one slab.
+
+    Only the lower triangle is ever read (``symmetrize_input=False``); the windowed update writes
+    over the upper one, which each later panel zeroes, so the factor ends exactly lower triangular."""
+    from jax import shard_map
+    from jax.sharding import PartitionSpec as P
+    Np, bs = int(b.shape[0]), SOLVE_BLOCK
+    nl = Np // int(mesh.size)
+    nb, nbl = Np // bs, nl // bs
+    slab = bs * max(q for q in (4, 2, 1) if nbl % q == 0)
+    bounds = sorted({round(p * nb / FACTOR_PHASES) for p in range(FACTOR_PHASES + 1)})
+
+    def local(b, R, n, lam):
+        me = lax.axis_index("g")
+        rows = lambda x: lax.dynamic_slice_in_dim(x, me * nl, nl)
+        grow = me * nl + jnp.arange(nl)                          # global index of each local row
+        A = coulomb_block(rows(b), rows(R), rows(n), b, R, n)   # (nl, Np): this device's rows of V
+        A = A.at[jnp.arange(nl), grow].add(lam)
+
+        def step(c0, k, A):
+            mine, lk = k // nbl == me, (k % nbl) * bs
+            D = lax.psum(jnp.where(mine, lax.dynamic_slice(A, (lk, k * bs), (bs, bs)), 0.0), "g")
+            Lkk = jnp.tril(lax.linalg.cholesky(D, symmetrize_input=False))
+            X = lax.linalg.triangular_solve(Lkk, lax.dynamic_slice_in_dim(A, k * bs, bs, axis=1),
+                                            left_side=False, lower=True, transpose_a=True)
+            X = jnp.where(grow[:, None] >= (k + 1) * bs, X, 0.0)
+            X = jnp.where(mine, lax.dynamic_update_slice(X, Lkk, (lk, 0)), X)
+            A = lax.dynamic_update_slice_in_dim(A, X, k * bs, axis=1)
+            if c0 >= Np:                                         # the last panel: nothing past it
+                return A
+            Pn = lax.all_gather(X, "g", tiled=True)[c0:]
+            Pn = jnp.where((c0 + jnp.arange(Np - c0))[:, None] >= (k + 1) * bs, Pn, 0.0)
+
+            def update(s, A):
+                blk = lax.dynamic_slice(A, (s * slab, c0), (slab, Np - c0))
+                upd = blk - lax.dynamic_slice_in_dim(X, s * slab, slab) @ Pn.T
+                return lax.dynamic_update_slice(A, upd, (s * slab, c0))
+            return lax.fori_loop(0, nl // slab, update, A)
+
+        for k0, k1 in zip(bounds[:-1], bounds[1:]):
+            A = lax.fori_loop(k0, k1, functools.partial(step, (k0 + 1) * bs), A)
+        return A
+
+    return shard_map(local, mesh=mesh, in_specs=(P(), P(), P(), P()), out_specs=P("g"),
+                     check_vma=False)(b, R, n, lam)
+
+
+def _row_solves(Lrows, gamma, axis, b):
+    """``y = L⁻¹γ`` and ``x = L⁻ᵀy`` with the rows of the lower-triangular ``L`` dealt over ``axis``
+    in contiguous blocks (``Lrows``: this device's rows, all columns). Blocked substitution, ``b``
+    rows a block: the owner of block i solves its diagonal block and broadcasts the piece, and every
+    device updates its own rows (forward) or adds its rows' share of the next piece (backward).
+
+    Never transposes ``L``: a whole-matrix transposed solve made XLA copy the factor, a second
+    N_aux² on every device."""
+    nlb, Np = Lrows.shape
+    nl, nb = nlb // b, Np // b
+    me = lax.axis_index(axis)
+    g = jnp.zeros(Np, gamma.dtype).at[:gamma.shape[0]].set(gamma)
+    eye = jnp.eye(b, dtype=Lrows.dtype)
+
+    def diag(i):
+        """Whether this device owns block i, its local row offset, and its diagonal block (the
+        identity elsewhere, so the other devices' solves stay finite; their result is dropped)."""
+        own = i // nl == me
+        l0 = (i % nl) * b
+        return own, l0, jnp.where(own, lax.dynamic_slice(Lrows, (l0, i * b), (b, b)), eye)
+
+    def trsv(blk, v, transpose):
+        return lax.linalg.triangular_solve(blk, v[:, None], left_side=True, lower=True,
+                                           transpose_a=transpose)[:, 0]
+
+    def forward(i, c):
+        r, y = c
+        own, l0, blk = diag(i)
+        yi = lax.psum(jnp.where(own, trsv(blk, lax.dynamic_slice_in_dim(r, l0, b), False), 0.0),
+                      axis)
+        r = r - lax.dynamic_slice_in_dim(Lrows, i * b, b, axis=1) @ yi
+        return r, lax.dynamic_update_slice_in_dim(y, yi, i * b, 0)
+
+    _, y = lax.fori_loop(0, nb, forward, (lax.dynamic_slice_in_dim(g, me * nlb, nlb),
+                                          jnp.zeros(Np, g.dtype)))
+
+    def backward(k, xl):
+        i = nb - 1 - k
+        own, l0, blk = diag(i)
+        s = lax.psum(lax.dynamic_slice_in_dim(Lrows, i * b, b, axis=1).T @ xl, axis)
+        xi = trsv(blk, lax.dynamic_slice_in_dim(y, i * b, b) - s, True)
+        return jnp.where(own, lax.dynamic_update_slice_in_dim(xl, xi, l0, 0), xl)
+
+    xl = lax.fori_loop(0, nb, backward, jnp.zeros(nlb, g.dtype))
+    return y, lax.all_gather(xl, axis, tiled=True), xl
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def df_coulomb_solve_rows(gamma, Lrows, axis):
+    """The metric tail of RI-J on a mesh: E_J^DF = ½ γᵀ (L Lᵀ)⁻¹ γ, called inside ``shard_map`` with
+    the replicated γ and this device's rows of the padded factor (:func:`metric_factor`), so each
+    device holds N_aux²/G of it. The same value as :func:`df_coulomb_solve`; its gradient in γ is
+    d = (L Lᵀ)⁻¹ γ, made in the forward."""
+    return _solve_rows_fwd(gamma, Lrows, axis)[0]
+
+
+def _solve_rows_fwd(gamma, Lrows, axis):
+    y, x, xl = _row_solves(Lrows, gamma, axis, SOLVE_BLOCK)
+    d = x[:gamma.shape[0]]
+    return 0.5 * jnp.dot(gamma, d), (d, xl, y)
+
+
+def _solve_rows_bwd(axis, res, gbar):
+    """γ̄ = ḡ d; and L̄_ij = −ḡ x_i y_j on the lower triangle, this device's rows (needed only when
+    the factor itself is differentiated, as on-graph forces do; the trainer's step drops it).
+
+    The value is the same on every device, and ``shard_map`` hands each its share of the cotangent:
+    γ is replicated, so its cotangent is summed over the devices on the way back, while each device
+    alone owns its rows of L, which therefore take the summed ḡ here."""
+    d, xl, y = res
+    rows = lax.axis_index(axis) * xl.shape[0] + jnp.arange(xl.shape[0])
+    lower = jnp.arange(y.shape[0])[None, :] <= rows[:, None]
+    return gbar * d, jnp.where(lower, -lax.psum(gbar, axis) * xl[:, None] * y[None, :], 0.0)
+
+
+df_coulomb_solve_rows.defvjp(_solve_rows_fwd, _solve_rows_bwd)
 
 
 def df_coulomb_energy_screened(splats, C_occ, occ, aux, pi, pj, lam=1e-8, chunk=2048, valid=None,

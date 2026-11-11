@@ -1,0 +1,146 @@
+{
+ "sf6": {
+  "rung": "7",
+  "formula": "F6S",
+  "n_atoms": 7,
+  "source": "octahedral, r(S-F) = 1.561 A (gas-phase electron diffraction)",
+  "n_heavy": 7,
+  "min_heavy_heavy_A": 1.561,
+  "min_any_A": 1.561,
+  "nelec": 70,
+  "nao": {
+   "cc-pvdz": 102,
+   "cc-pvtz": 214,
+   "cc-pvqz": 389,
+   "cc-pv5z": 641
+  },
+  "naux_sph": 590,
+  "naux_cart": 713
+ },
+ "cubane": {
+  "rung": "16",
+  "formula": "C8H8",
+  "n_atoms": 16,
+  "source": "PubChem CID 136090 3-D conformer",
+  "n_heavy": 8,
+  "min_heavy_heavy_A": 1.5352,
+  "min_any_A": 1.0823,
+  "nelec": 56,
+  "nao": {
+   "cc-pvdz": 152,
+   "cc-pvtz": 352,
+   "cc-pvqz": 680,
+   "cc-pv5z": 1168
+  },
+  "naux_sph": 744,
+  "naux_cart": 872
+ },
+ "adenine_thymine": {
+  "rung": "30",
+  "formula": "C10H11N7O2",
+  "n_atoms": 30,
+  "source": "S22 complex 7, adenine-thymine Watson-Crick (Jurecka et al. 2006), from Psi4's S22 database",
+  "n_heavy": 19,
+  "min_heavy_heavy_A": 1.2181,
+  "min_any_A": 1.0034,
+  "nelec": 136,
+  "nao": {
+   "cc-pvdz": 321,
+   "cc-pvtz": 724,
+   "cc-pvqz": 1375,
+   "cc-pv5z": 2334
+  },
+  "naux_sph": 1641,
+  "naux_cart": 1947
+ },
+ "porphine": {
+  "rung": "38",
+  "formula": "C20H14N4",
+  "n_atoms": 38,
+  "source": "PubChem CID 66868 3-D conformer",
+  "n_heavy": 24,
+  "min_heavy_heavy_A": 1.3004,
+  "min_any_A": 1.0068,
+  "nelec": 162,
+  "nao": {
+   "cc-pvdz": 406,
+   "cc-pvtz": 916,
+   "cc-pvqz": 1740,
+   "cc-pv5z": 2954
+  },
+  "naux_sph": 2060,
+  "naux_cart": 2432
+ },
+ "retinal": {
+  "rung": "49",
+  "formula": "C20H28O",
+  "n_atoms": 49,
+  "source": "PubChem CID 638015 3-D conformer",
+  "n_heavy": 21,
+  "min_heavy_heavy_A": 1.2264,
+  "min_any_A": 1.0806,
+  "nelec": 156,
+  "nao": {
+   "cc-pvdz": 434,
+   "cc-pvtz": 1022,
+   "cc-pvqz": 1995,
+   "cc-pv5z": 3451
+  },
+  "naux_sph": 2081,
+  "naux_cart": 2433
+ },
+ "cholesterol": {
+  "rung": "74",
+  "formula": "C27H46O",
+  "n_atoms": 74,
+  "source": "PubChem CID 5997 3-D conformer",
+  "n_heavy": 28,
+  "min_heavy_heavy_A": 1.3444,
+  "min_any_A": 0.9725,
+  "nelec": 216,
+  "nao": {
+   "cc-pvdz": 622,
+   "cc-pvtz": 1484,
+   "cc-pvqz": 2920,
+   "cc-pv5z": 5078
+  },
+  "naux_sph": 2930,
+  "naux_cart": 3416
+ },
+ "chignolin": {
+  "rung": "100-200",
+  "formula": "C62H75N11O20",
+  "n_atoms": 168,
+  "source": "PDB 5AWL (CLN025, X-ray 1.11 A) + H, neutral; RDKit MMFF94 on H only",
+  "n_heavy": 93,
+  "min_heavy_heavy_A": 1.2051,
+  "min_any_A": 0.9709,
+  "nelec": 684,
+  "nao": {
+   "cc-pvdz": 1677,
+   "cc-pvtz": 3840,
+   "cc-pvqz": 7365,
+   "cc-pv5z": 12588
+  },
+  "naux_sph": 8387,
+  "naux_cart": 9901
+ },
+ "cyclosporin": {
+  "rung": "100-200",
+  "formula": "C62H111N11O12",
+  "n_atoms": 196,
+  "source": "PubChem CID 5284373 SMILES; RDKit ETKDGv3 + MMFF94, lowest of 30",
+  "n_heavy": 85,
+  "min_heavy_heavy_A": 1.2284,
+  "min_any_A": 0.9731,
+  "nelec": 656,
+  "nao": {
+   "cc-pvdz": 1745,
+   "cc-pvtz": 4104,
+   "cc-pvqz": 8005,
+   "cc-pv5z": 13840
+  },
+  "naux_sph": 8419,
+  "naux_cart": 9877
+ }
+}

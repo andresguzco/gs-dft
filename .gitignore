@@ -50,3 +50,6 @@ experiments/**/*.pdf
 
 # The paper lives in its own repository.
 paper/
+
+# Rendered rebuttal figures (experiments/rebuttal/figures.py); the paper keeps its own copies.
+experiments/rebuttal/figures/

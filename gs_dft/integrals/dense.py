@@ -43,7 +43,7 @@ __all__ = [
 # to ~1e-7. As numpy they are cast at trace time under the active precision.
 # ---------------------------------------------------------------------------
 
-def _gauss_legendre_halfline(n_quad: int = 20):
+def _gauss_legendre_halfline(n_quad: int):
     """Gauss-Legendre on [0,∞) via t = s/(1-s)."""
     nodes_01, weights_01 = np.polynomial.legendre.leggauss(n_quad)
     s = (nodes_01 + 1.0) / 2.0
@@ -64,8 +64,9 @@ def _gauss_legendre_segment(upper: float, n_quad: int = 12):
     table — the 3-centre (aux|pair) nodes, the pair screening — becomes range-separated by being
     handed a different table.
 
-    12 nodes, not 20. The half-line map needs 20 because it must resolve a t^{-3} tail out to
-    infinity; on [0, 0.3] the integrand is smooth and 12 nodes give ~1e-13 (8 give 1e-8), measured
+    12 nodes, against the half-line map's 64. The half-line map needs many because it must resolve a
+    t^{-3} tail out to infinity and the small-t end that carries the long range; on [0, 0.3] the
+    integrand is smooth and 12 nodes give ~1e-13 (8 give 1e-8), measured
     across exponent ratios from 0.05 to 60. So the long-range pass is CHEAPER than the short-range
     one, not an extra copy of it.
     """
@@ -74,7 +75,11 @@ def _gauss_legendre_segment(upper: float, n_quad: int = 12):
     return np.asarray(t, dtype=np.float64), np.asarray(0.5 * float(upper) * w, dtype=np.float64)
 
 
-_QUAD_T, _QUAD_W = _gauss_legendre_halfline(20)
+# Total-energy error against 128 nodes (experiments/kernels/check_quadrature.py): 20 nodes gave
+# −44 mHa on a trained ala_15 and −1.39 Ha on insulin TZ, 48 nodes −2.8 mHa on insulin, 64 nodes
+# ≤ 14 µHa up to insulin. Every Coulomb kernel on this table (RI fit, V_ne, exact E_H) reads it.
+LAPLACE_NODES = 64
+_QUAD_T, _QUAD_W = _gauss_legendre_halfline(LAPLACE_NODES)
 
 # Python-float copies for the STATIC unrolled node loops (trace-time constants —
 # coulomb.ri / screening.pairs unroll the nodes so XLA fuses the loop into one kernel).
@@ -122,9 +127,15 @@ def exchange_energy(K, P):
 _PAIR_BUDGET = 2 ** 26
 
 
-def _row_chunk(M: int) -> int:
-    """Rows per block, so the (c, M, 3, 3) intermediate stays near :data:`_PAIR_BUDGET`."""
-    return max(1, min(int(M), _PAIR_BUDGET // max(1, 9 * int(M))))
+def _row_chunk(M: int, R: int | None = None, budget: int = _PAIR_BUDGET) -> int:
+    """Rows per block for ``R`` rows (default ``M``) against ``M`` columns: the fewest blocks that keep
+    the (c, M, 3, 3) intermediate within ``budget`` elements, at equal sizes, so the padded tail is
+    under one row per block. Budget-sized blocks padded a mesh device's M/G rows to a whole block
+    (retinal, M 1022: 511 rows per device at G = 2 ran as 1022)."""
+    R = int(M) if R is None else int(R)
+    c = max(1, min(R, int(budget) // max(1, 9 * int(M))))
+    n = -(-R // c)
+    return -(-R // n)
 
 
 def _by_rows(row_fn, M: int):
@@ -208,11 +219,11 @@ def kinetic_times(splats, X) -> Float[Array, "M K"]:
     return _by_rows_times(_kinetic_rows(splats), int(splats.n_basis), X)
 
 
-def _by_rows_times_idx(row_fn, rows, X):
+def _by_rows_times_idx(row_fn, rows, X, budget=_PAIR_BUDGET):
     """``(A @ X)[rows]`` for an explicit row index array — a device's slice of the row-blocked
     contraction, so a mesh can split the O(M²·K) one-electron work instead of replicating it."""
     R = int(rows.shape[0])
-    c = _row_chunk(int(X.shape[0]))
+    c = _row_chunk(int(X.shape[0]), R, budget)
     pad = (-R) % c
     idx = jnp.concatenate([rows, jnp.zeros(pad, rows.dtype)]).reshape(-1, c)
 
@@ -222,14 +233,14 @@ def _by_rows_times_idx(row_fn, rows, X):
     return lax.map(jax.checkpoint(blk, prevent_cse=False), idx).reshape(-1, X.shape[-1])[:R]
 
 
-def overlap_times_rows(splats, X, rows) -> Float[Array, "R K"]:
-    """``(S @ X)[rows]`` without forming S."""
-    return _by_rows_times_idx(_overlap_rows(splats), rows, X)
+def overlap_times_rows(splats, X, rows, budget=_PAIR_BUDGET) -> Float[Array, "R K"]:
+    """``(S @ X)[rows]`` without forming S, in row blocks of ``budget`` (c, M, 3, 3) elements."""
+    return _by_rows_times_idx(_overlap_rows(splats), rows, X, budget)
 
 
-def kinetic_times_rows(splats, X, rows) -> Float[Array, "R K"]:
-    """``(T @ X)[rows]`` without forming T."""
-    return _by_rows_times_idx(_kinetic_rows(splats), rows, X)
+def kinetic_times_rows(splats, X, rows, budget=_PAIR_BUDGET) -> Float[Array, "R K"]:
+    """``(T @ X)[rows]`` without forming T, in row blocks of ``budget`` (c, M, 3, 3) elements."""
+    return _by_rows_times_idx(_kinetic_rows(splats), rows, X, budget)
 
 
 def _pairwise_rows(splats, rows):

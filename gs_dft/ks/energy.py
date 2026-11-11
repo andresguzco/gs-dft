@@ -28,6 +28,10 @@ overlap/kinetic always dense (screening S/T tips the occupied Grams indefinite
 quadrature dense or streamed by the grid spec's ``chunk``.
 """
 
+import dataclasses
+
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
@@ -192,7 +196,7 @@ class SplatKS(eqx.Module):
             mesh: a 1-D device mesh (``shard.make_mesh()``) to shard the
                 screened step across devices; ``None`` = single device.
             cells: a :func:`~gs_dft.ks.terms.cellgrid` spec — the
-                block-sparse grid density (6.2x on the density term at ala_15).
+                block-sparse grid density (3.8x on the XC term at penicillin).
                 MORTON-SORTS the grid here, which is safe because the XC energy
                 is a sum over points. ``None`` = the dense/chunked path.
         """
@@ -223,29 +227,44 @@ class SplatKS(eqx.Module):
             # degenerates to every splat. Sorting is safe — E_xc is a sum over points, so `gp`/`gw`
             # just travel together and nothing needs un-permuting.
             #
-            # Sort here but partition below, after the mesh pad: the partition must cover the
-            # final grid, and it needs `ndev` to cut cells at the device boundaries.
+            # Sort and deal here but partition below, after the mesh pad (a no-op on a dealt grid):
+            # the partition must cover the final grid, and it needs `ndev` for the device blocks.
             perm, _ = _cells.morton_order(gp)
             gp, gw = gp[perm], gw[perm]
+            # On a mesh, the cells are dealt round-robin over the devices (each device's block of
+            # the grid holds its cells' points, padded with zero-weight copies of the first point,
+            # as the mesh pad is), so every device's lists sample the whole molecule — see
+            # cells.deal_order. One device: unchanged.
+            order = _cells.deal_order(gp, int(mesh.size) if mesh is not None else 1, k=cells.k,
+                                      cap=cells.cap, n_pt_buckets=cells.pt_buckets)
+            fill = jnp.asarray(order < 0)
+            idx = jnp.asarray(np.where(order < 0, order[0], order))      # pads: the first point again
+            gp, gw = gp[idx], jnp.where(fill, 0.0, gw[idx])
             self.cell_spec = cells
         # chunk may be "auto" (the engine's default since its grid rewrite), an int, or None.
         # "auto" = let the engine size it; we hold no budget model here, so treat it as unset.
         self.grid_chunk = None if chunk is None or chunk == "auto" else int(chunk)
         spec = exact() if coulomb is None else coulomb
-        self.screen = screen
-        self.coulomb = _make_coulomb(spec, screened=screen is not None, a_x=hf_coeff(xc),
-                                     a_x_lr=float(getattr(xc, "hf_coeff_lr", 0.0) or 0.0),
-                                     omega=float(getattr(xc, "omega", 0.0) or 0.0),
-                                     skip_pad=bool(screen is not None and screen.skip_pad))
-        if screen is not None and screen.unique and self.coulomb.hf_coeff != 0.0:
+        a_x, a_lr = hf_coeff(xc), float(getattr(xc, "hf_coeff_lr", 0.0) or 0.0)
+        hybrid = a_x != 0.0 or a_lr != 0.0
+        if screen is not None and screen.unique is None:          # by the functional
+            screen = dataclasses.replace(screen, unique=not hybrid)
+        if screen is not None and screen.unique and hybrid:
             raise ValueError("pairlist(unique=True) is PBE-class only: the screened RI-K "
                              "contraction is not symmetric in the pair index")
+        self.screen = screen
+        self.coulomb = _make_coulomb(spec, screened=screen is not None, a_x=a_x, a_x_lr=a_lr,
+                                     omega=float(getattr(xc, "omega", 0.0) or 0.0),
+                                     skip_pad=bool(screen is not None and screen.skip_pad))
         if mesh is not None:
             if screen is None:
                 raise ValueError("mesh= shards the SCREENED step; pass screen=pairlist(...).")
-            if self.coulomb.hf_coeff != 0.0:
+            if self.coulomb.hf_coeff != 0.0 or self.coulomb.hf_coeff_lr != 0.0:
                 raise ValueError("the sharded screened path is pure-functional only "
                                  "(no sharded RI-K); use a non-hybrid xc with mesh=.")
+            if float(getattr(xc, "nlc_b", 0.0) or 0.0):
+                raise ValueError("the sharded screened path has no VV10 term; run "
+                                 f"{type(xc).__name__} with mesh=None")
             # Build ≠ run: the mesh is a BUILD choice, so the grid is laid out for it
             # here — padded to a mesh-size multiple (clone point 0, zero weight ⇒ no XC
             # contribution) and, multi-node, promoted to a "g"-sharded global array with
@@ -265,7 +284,7 @@ class SplatKS(eqx.Module):
             # After the mesh pad, so the partition covers the FINAL grid and its cells are cut at
             # the device boundaries. ndev=1 (no mesh) still emits the leading device axis.
             self.cell_part = _cells.cell_partition(
-                gp, k=cells.k, cap=cells.cap, n_pt_buckets=cells.pt_buckets,
+                gp, k=cells.k, cap=cells.cap, n_pt_buckets=cells.pt_buckets, align=cells.align,
                 ndev=(int(mesh.size) if mesh is not None else 1))
         self.grid_points = gp
         self.grid_weights = gw
@@ -425,12 +444,12 @@ def refresh(ks: SplatKS, basis, *, pad_to: int | None = None,
     Host-side; call at init and every time the splats have moved enough (the
     trainers do it on a fixed cadence). Builds exactly what ``ks`` needs:
 
-    - the significant-pair list when ``ks`` screens (padded to ``pad_to`` with
-      overflow keeping the largest-overlap pairs, so the jitted step keeps a
-      constant shape and compiles once — required on multi-GPU);
-    - the frozen product aux (and the K-aux for hybrids) when ``ks`` density-fits.
+    - the significant-pair list when ``ks`` screens (padded to ``pad_to``, so the
+      compiled step keeps a constant shape; an overflow raises);
+    - the frozen product aux (and the K-aux for hybrids) when ``ks`` density-fits;
+    - the cell lists when ``ks`` has ``cells`` (an overflow of ``like``'s widths raises).
 
-    ``like=previous_state`` inherits the previous pair pad, so a hand-rolled
+    ``like=previous_state`` inherits the previous pair pad and cell-list shapes, so a hand-rolled
     refresh loop keeps constant shapes (and the compile-once contract) without
     threading the pad explicitly:
 
@@ -445,11 +464,12 @@ def refresh(ks: SplatKS, basis, *, pad_to: int | None = None,
         # Inherit the splat-list widths from the previous state, the same contract `pad_to` gives
         # the pair list: constant shapes for the whole run (see screening.neighbor_pairs for why
         # a mid-run recompile is fatal on a mesh).
-        s_pad = ([int(g[2].shape[-1]) for g in like.cells]     # (ndev, nc, S) -> S
-                 if like is not None and like.cells is not None else None)
-        cells, _ = _cells.cell_lists(basis, ks.grid_points, ks.cell_part,
-                                     eps=ks.cell_spec.eps, s_pad=s_pad,
+        layout = ([tuple(int(x) for x in g[2].shape[1:]) for g in like.cells]  # (ndev, n, S)
+                  if like is not None and like.cells is not None else None)
+        cells, _ = _cells.cell_lists(basis, ks.cell_part,
+                                     eps=ks.cell_spec.eps, layout=layout,
                                      headroom=ks.cell_spec.headroom,
+                                     margin=ks.cell_spec.margin, align=ks.cell_spec.align,
                                      n_sp_buckets=ks.cell_spec.sp_buckets)
     pairs = None
     if ks.screen is not None:
@@ -468,9 +488,10 @@ def refresh(ks: SplatKS, basis, *, pad_to: int | None = None,
             aux_K = aux                     # the SAME product basis serves K (identical build)
         # Frozen aux ⇒ the RI-J metric is constant until the next refresh: factor it ONCE
         # (the per-step solve becomes an O(N_aux²) cho_solve — the only O(N_aux³) piece
-        # of the step otherwise, ~13% of an insulin-scale step).
+        # of the step otherwise, ~13% of an insulin-scale step). On a mesh, built and factored by
+        # row blocks across the devices, each keeping only its own rows.
         from gs_dft.coulomb import ri as _cdf
-        cholV = _cdf.aux_cholesky(aux, ks.coulomb.lam)
+        cholV = _cdf.metric_factor(aux, ks.coulomb.lam, ks.mesh)
     return SplatState(pairs=pairs, aux=aux, aux_K=aux_K, cholV=cholV, cells=cells)
 
 

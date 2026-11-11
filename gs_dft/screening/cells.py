@@ -21,17 +21,24 @@ mesh), so the split here is:
   their ``P`` pads are fixed for the whole run. Built once.
 * :func:`cell_lists` — depends on the splats, which move, so it is rebuilt on the refresh cadence.
   Only the significant-splat sets change; they are padded to a fixed ``S`` (chosen once with
-  headroom) and overflow keeps the nearest splats, exactly as the pair list caps its overflow.
+  headroom), and a cell past its ``S`` raises :class:`CellOverflow`.
 """
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
 from gs_dft.coulomb.stream import full_quantities
-from gs_dft.screening.grid import _full_eval_block, _host_rcut
+from gs_dft.screening.grid import _host_rcut
 
-__all__ = ["morton_order", "cell_partition", "cell_lists", "cell_density_and_grad", "Partition"]
+__all__ = ["morton_order", "cell_partition", "cell_lists", "cell_density_and_grad", "Partition",
+           "CellOverflow"]
+
+
+class CellOverflow(RuntimeError):
+    """A cell has more significant splats than its list's fixed width (fixed for the run)."""
 
 
 class Partition:
@@ -48,10 +55,11 @@ class Partition:
     one partition for its whole life.
     """
 
-    __slots__ = ("groups",)
+    __slots__ = ("groups", "geom")
 
-    def __init__(self, groups):
+    def __init__(self, groups, geom=()):
         self.groups = tuple(groups)
+        self.geom = tuple(geom)          # per group: cell centres (ndev,nc,3), radii (ndev,nc)
 
     def __iter__(self):
         return iter(self.groups)
@@ -88,16 +96,78 @@ def morton_order(grid_points, bits: int = 10):
     return np.argsort(key, kind="stable"), key
 
 
-def cell_partition(grid_points, *, k: int = 5, cap: int = 1024, bits: int = 10, n_pt_buckets: int = 4,
-                   group_points: int = 250_000, ndev: int = 1):
+def _align(n, align):
+    return -(-int(n) // int(align)) * int(align)
+
+
+def _cell_geometry(gp, pi, pm, blk):
+    """Per cell: the mean of its points and their largest distance from it (0 for an empty cell)."""
+    pts = gp[np.arange(pi.shape[0])[:, None, None] * blk + pi]          # (ndev, nc, P, 3)
+    n = pm.sum(-1)
+    c = np.where(pm[..., None], pts, 0.0).sum(2) / np.maximum(n, 1)[..., None]
+    R = np.where(pm, np.sqrt(((pts - c[:, :, None]) ** 2).sum(-1)), 0.0).max(-1)
+    return c, R
+
+
+def _pt_edges(cap, n_pt_buckets):
+    """Point-bucket edges: (cap/2, cap], (cap/4, cap/2], ... (a cell pads to at most twice its points)."""
+    return cap / 2.0 ** np.arange(n_pt_buckets - 1, 0, -1)
+
+
+def deal_order(grid_points, ndev, *, k: int = 5, cap: int = 1024, bits: int = 10,
+               n_pt_buckets: int = 6):
+    """The order of a Morton-sorted grid that deals its cells round-robin over ``ndev`` devices.
+
+    Returns ``order`` (ndev·blk,): device d's block of the grid is ``order[d·blk:(d+1)·blk]``,
+    indices into ``grid_points``, −1 for a padding slot (a zero-weight point). The cells are the runs
+    :func:`cell_partition` makes (Morton cell, split at ``cap``); taken bucket by bucket, each in
+    Morton order, run i goes to device i mod ndev, and each device keeps its runs in Morton order.
+    ``ndev = 1`` is the identity.
+
+    Contiguous blocks would give each device one region of space, and a cell's work follows the
+    splats there; the lists are padded to the widest device (one shape for shard_map), so every
+    device would pay the busiest one's work. Dealt cells give every device a sample of the whole
+    molecule, so the lists match and the padding vanishes, however the splats move.
+    """
+    gp = np.asarray(grid_points)
+    n = gp.shape[0]
+    if ndev == 1:
+        return np.arange(n)
+    _, key = morton_order(gp, bits)
+    if np.any(np.diff(key) < 0):
+        raise ValueError("deal_order: the grid must be in Morton order")
+    cell = key >> np.int64(3 * (bits - k))
+    _, first = np.unique(cell, return_index=True)
+    last = np.append(first[1:], n)
+    starts = np.concatenate([np.arange(a, b, cap) for a, b in zip(first, last)])
+    lens = np.minimum(cap, np.repeat(last, -(-(last - first) // cap)) - starts)
+    bucket = np.digitize(lens, _pt_edges(cap, n_pt_buckets), right=True)
+    rank = np.empty(len(starts), np.int64)                     # position within its bucket, carried
+    off = 0                                                     # across buckets so no device is first
+    for b in np.unique(bucket):                                 # in all of them
+        sel = np.flatnonzero(bucket == b)
+        rank[sel] = off + np.arange(sel.size)
+        off += sel.size
+    dev = rank % ndev
+    blocks = [np.concatenate([np.arange(s, s + m) for s, m in zip(starts[dev == d], lens[dev == d])])
+              for d in range(ndev)]
+    order = np.full((ndev, max(len(b) for b in blocks)), -1, np.int64)
+    for d, b in enumerate(blocks):
+        order[d, :len(b)] = b
+    return order.reshape(-1)
+
+
+def cell_partition(grid_points, *, k: int = 5, cap: int = 1024, bits: int = 10, n_pt_buckets: int = 6,
+                   group_points: int | None = None, ndev: int = 1, align: int = 8):
     """Static point grouping — depends only on the grid, so build it once.
 
     Returns ``[(pt_idx (ndev,nc,P) int32, pt_mask (ndev,nc,P) bool), ...]``, one entry per
-    point-count bucket. Assumes ``grid_points`` is already in :func:`morton_order`.
+    point-count bucket, ``P`` rounded up to a multiple of ``align`` (masked) for the batched GEMMs.
+    Assumes ``grid_points`` is already in :func:`morton_order`.
 
-    ``group_points`` caps points per emitted group: the live tensors are ``(nc, P, S)`` and its
-    gradient, and the backward holds several, so an uncapped bucket OOMs. Capping bounds each launch
-    without changing what is computed.
+    ``group_points`` caps points per emitted group (``None``: one group per bucket). Memory does not
+    need it, :func:`cell_density_and_grad` runs each list in chunks of cells, and every group adds
+    lists to compile.
 
     ``cap`` splits oversized cells into contiguous Morton runs. That is not only a memory guard:
     cell occupancy is wildly skewed (k=4 ranges 1 … 44,886 points), and a sub-run's bounding sphere
@@ -111,7 +181,7 @@ def cell_partition(grid_points, *, k: int = 5, cap: int = 1024, bits: int = 10, 
     serves both paths: sharded, ``shard_map`` slices it; single-device, ``ndev=1`` and the caller
     takes ``[0]``.
 
-    The device axis forces uniform shapes: buckets are cut on global quantiles (so every device
+    The device axis forces uniform shapes: buckets are cut at fixed widths (so every device
     agrees on which bucket a run belongs to) and ``nc`` is padded to the max over devices. Without
     that, devices would trace different shapes and ``shard_map`` would reject the call.
     """
@@ -137,20 +207,22 @@ def cell_partition(grid_points, *, k: int = 5, cap: int = 1024, bits: int = 10, 
                 rs.append(grp[s0:s0 + cap])
         runs_dev.append(rs)
 
+    # Point buckets halve from cap down, (cap/2, cap], (cap/4, cap/2], ...: a cell pads to at most
+    # twice its points. Quantiles of the run lengths are set by the many near-empty far cells, and
+    # pad every run of 7 … 1024 points to 1024.
     npts_all = np.array([len(r) for rs in runs_dev for r in rs])
-    edges = np.unique(np.quantile(npts_all, np.linspace(0, 1, n_pt_buckets + 1)[1:-1])) \
-        if n_pt_buckets > 1 else np.array([])
-    sel_dev = [np.digitize([len(r) for r in rs], edges) for rs in runs_dev]
+    edges = _pt_edges(cap, n_pt_buckets)
+    sel_dev = [np.digitize([len(r) for r in rs], edges, right=True) for rs in runs_dev]
 
     out = []
-    for b in sorted(set(np.digitize(npts_all, edges).tolist())):
+    for b in sorted(set(np.digitize(npts_all, edges, right=True).tolist())):
         picks = [np.flatnonzero(sd == b) for sd in sel_dev]
         P = max((len(runs_dev[d][i]) for d in range(ndev) for i in picks[d]), default=1)
-        P = max(int(P), 1)
+        P = _align(max(int(P), 1), align)
         nc_tot = max((len(p) for p in picks), default=0)     # pad every device to the widest
         if nc_tot == 0:
             continue
-        nc_cap = max(1, int(group_points // P))
+        nc_cap = nc_tot if group_points is None else max(1, int(group_points // P))
         for lo in range(0, nc_tot, nc_cap):
             nc = min(nc_cap, nc_tot - lo)
             pi = np.zeros((ndev, nc, P), np.int32)
@@ -161,105 +233,252 @@ def cell_partition(grid_points, *, k: int = 5, cap: int = 1024, bits: int = 10, 
                     pi[d, r_, :len(run)] = run
                     pm[d, r_, :len(run)] = True
             out.append((pi, pm))
-    return Partition(out)
+    return Partition(out, [_cell_geometry(gp, pi, pm, blk) for pi, pm in out])
 
 
-def cell_lists(splats, grid_points, partition, *, eps: float = 1e-8, s_pad=None,
-               headroom: float = 1.5, n_sp_buckets: int = 4):
-    """Per-cell significant splats at FIXED width — rebuilt on the refresh cadence.
-
-    ``s_pad`` (a list, one width per partition bucket) pins the shape for the whole run; pass the
-    previous one back to keep the step compiled once. When a cell exceeds its width the NEAREST
-    splats are kept, mirroring the pair list's overflow policy — it drops only the marginal tail.
-
-    Carries :func:`cell_partition`'s leading DEVICE axis through: point indices are local to a
-    device block, splat indices are global (the splats are replicated, only the grid is sharded).
-    ``S`` is the max over every device AND cell, so all devices trace one shape.
-    """
-    gp = np.asarray(grid_points)
-    mu = np.asarray(splats.centers)
-    rcut = np.asarray(_host_rcut(splats, eps))
-    ndev = int(partition[0][0].shape[0])
-    blk = gp.shape[0] // ndev
-    groups, widths = [], []
-    out_b = 0
-    for pi, pm in partition:
-        nc = pi.shape[1]
-        keeps, dists = {}, {}
-        for d in range(ndev):
-            for r_ in range(nc):
-                sel = pi[d, r_][pm[d, r_]]
-                if sel.size == 0:                             # device padded past its own run count
-                    keeps[(d, r_)] = np.zeros(0, np.int64)    # nothing significant; mask stays False
-                    continue
-                pts = gp[d * blk + sel]                       # LOCAL index -> global grid row
-                c = pts.mean(0)
-                dd = np.sqrt(((mu - c) ** 2).sum(1))
-                keeps[(d, r_)] = np.flatnonzero(
-                    dd <= np.sqrt(((pts - c) ** 2).sum(1)).max() + rcut)
-                dists[(d, r_)] = dd
-
-        # Split each device's cells by significant-splat count before padding, or S is the worst
-        # cell in the whole point-bucket and the padding costs more than the dense path it replaces.
-        # `cell_partition` cannot do this (it is static); `cell_lists` can, since it sees the splats.
-        #
-        # Constant shapes are preserved by construction: cells are rank-ordered by count and cut at
-        # FIXED sizes, so every refresh emits the same (nc, P, S) even as membership churns. Cells
-        # whose count drifts past their range's S fall back to the keep-the-nearest truncation below.
-        order = {d: sorted(range(nc), key=lambda r_: len(keeps[(d, r_)])) for d in range(ndev)}
-        bounds = [(nc * j // n_sp_buckets, nc * (j + 1) // n_sp_buckets)
-                  for j in range(n_sp_buckets)]
-        for lo, hi in bounds:
-            if hi <= lo:
-                continue
-            n = hi - lo
-            want = max(1, max((len(keeps[(d, order[d][r_])]) for d in range(ndev)
-                               for r_ in range(lo, hi)), default=1))
-            S = int(s_pad[out_b]) if s_pad is not None else int(np.ceil(want * headroom))
-            gi = np.zeros((ndev, n, pi.shape[2]), np.int32)
-            gm = np.zeros((ndev, n, pi.shape[2]), bool)
-            si = np.zeros((ndev, n, S), np.int32)
-            sm = np.zeros((ndev, n, S), bool)
-            for d in range(ndev):
-                for k, r_ in enumerate(order[d][lo:hi]):
-                    gi[d, k] = pi[d, r_]
-                    gm[d, k] = pm[d, r_]
-                    sig = keeps[(d, r_)]
-                    if len(sig) > S:                          # overflow: keep the NEAREST
-                        sig = sig[np.argsort(dists[(d, r_)][sig])[:S]]
-                    si[d, k, :len(sig)] = sig
-                    sm[d, k, :len(sig)] = True
-            groups.append((jnp.asarray(gi), jnp.asarray(gm), jnp.asarray(si), jnp.asarray(sm)))
-            widths.append(S)
-            out_b += 1
-    return tuple(groups), widths
+def _keep(c, R, live, mu, rcut):
+    """(ndev, nc, M) bool: the splat's cutoff ball meets the cell's bounding sphere, in a cell that
+    holds points (a device's padding cells hold nothing)."""
+    d2 = (mu[:, 0] - c[..., 0:1]) ** 2                      # by axis: no (.., M, 3) array
+    d2 = d2 + (mu[:, 1] - c[..., 1:2]) ** 2
+    d2 = d2 + (mu[:, 2] - c[..., 2:3]) ** 2
+    return (jnp.sqrt(d2) <= R[..., None] + rcut) & live[..., None]
 
 
 @jax.jit
-def cell_density_and_grad(splats, C, occ, grid_points, cells):
-    """ρ(r), ∇ρ(r) by batched evaluation over fine cells. Equals the dense path to the ``eps`` tail."""
-    q = full_quantities(splats)
-    rho = jnp.zeros(grid_points.shape[0])
-    grad = jnp.zeros((grid_points.shape[0], 3))
-    def _one(q, C, pts, pm, si, sm):
-        sub = tuple(x[si] for x in q)                           # (nc, S, ...) gathered per CELL
-        g, dg = jax.vmap(_full_eval_block)(sub, pts)            # (nc,P,S), (nc,P,S,3)
-        keep = pm[:, :, None] & sm[:, None, :]
-        g = jnp.where(keep, g, 0.0)
-        dg = jnp.where(keep[..., None], dg, 0.0)
-        Cb = C[si]                                              # (nc, S, n_occ) ONCE per cell
-        psi = jnp.einsum("cps,cso->cpo", g, Cb)
-        r_c = jnp.sum(occ[None, None, :] * psi ** 2, axis=-1)
-        # Contract the orbital index before the gradient index: `einsum("cpsd,cso->cpod")`
-        # materializes (nc,P,n_occ,3). Algebraically ∇ρ = 2 Σ_i (Σ_o occ_o ψ_o C_io) ∇g_i, whose
-        # intermediate is (nc,P,S) — the size of `g`, and `g` is never re-evaluated.
-        w = jnp.einsum("o,cpo,cso->cps", occ, psi, Cb)
-        return r_c, 2.0 * jnp.einsum("cps,cpsd->cpd", w, dg)
+def _counts(c, R, live, mu, rcut):
+    """(ndev, nc) significant splats per cell."""
+    return jnp.sum(_keep(c, R, live, mu, rcut), axis=-1, dtype=jnp.int32)
 
-    for pi, pm, si, sm in cells:
-        # Remat per group, unconditionally: without it the backward keeps every group's (nc,P,S)
-        # and (nc,P,S,3) intermediates live at once. Costs ~1%, so there is no trade to expose.
-        r_c, g_c = jax.checkpoint(_one)(q, C, grid_points[pi], pm, si, sm)
-        rho = rho.at[pi].add(jnp.where(pm, r_c, 0.0))
-        grad = grad.at[pi].add(jnp.where(pm[..., None], g_c, 0.0))
+
+@functools.partial(jax.jit, static_argnums=(7,))
+def _lists(c, R, live, pi, pm, mu, rcut, shapes):
+    """One point group's lists at the static ``shapes`` ``((cells, width), ...)``: its cells ranked
+    by count (stable), cut at those sizes, each cell's significant splats ascending in its first
+    slots. Returns the lists and each list's widest cell (past its width = an overflow; the excess
+    is dropped here, and the caller raises)."""
+    keep = _keep(c, R, live, mu, rcut)
+    ndev, nc, M = keep.shape
+    cnt = jnp.sum(keep, axis=-1, dtype=jnp.int32)
+    order = jnp.argsort(cnt, axis=1, stable=True)
+    out, want, lo = [], [], 0
+    for n, S in shapes:
+        sel = order[:, lo:lo + n]                                          # (ndev, n)
+        lo += n
+        n_sel = jnp.take_along_axis(cnt, sel, 1)
+        k_sel = jnp.take_along_axis(keep, sel[..., None], 1)               # (ndev, n, M)
+        slot = jnp.where(k_sel, jnp.cumsum(k_sel, axis=-1, dtype=jnp.int32) - 1, S)
+        si = jnp.zeros((ndev, n, S), jnp.int32).at[
+            jnp.arange(ndev)[:, None, None], jnp.arange(n)[None, :, None], slot].set(
+            jnp.broadcast_to(jnp.arange(M, dtype=jnp.int32), k_sel.shape), mode="drop")
+        out.append((jnp.take_along_axis(pi, sel[..., None], 1), jnp.take_along_axis(pm, sel[..., None], 1),
+                    si, jnp.arange(S) < n_sel[..., None]))
+        want.append(jnp.max(n_sel))
+    return tuple(out), jnp.stack(want)
+
+
+def _cut(srt, n_lists, width, candidates=64):
+    """List sizes over the cells ranked by count (``srt``: the count at each rank, ascending) that
+    minimize Σ size × width(count at the list's top rank), over boundaries at ``candidates`` ranks."""
+    nc = len(srt)
+    B = np.unique(np.linspace(0, nc, min(candidates, nc) + 1).round().astype(int))
+    nb = len(B)
+    w = [width(int(srt[b - 1])) if b else 0 for b in B]
+    INF = float("inf")
+    f = [[INF] * nb for _ in range(n_lists + 1)]
+    arg = [[0] * nb for _ in range(n_lists + 1)]
+    f[0][0] = 0.0
+    for k in range(1, n_lists + 1):
+        for j in range(1, nb):
+            for i in range(j):
+                v = f[k - 1][i] + (B[j] - B[i]) * w[j]
+                if v < f[k][j]:
+                    f[k][j], arg[k][j] = v, i
+    k = min(range(1, n_lists + 1), key=lambda k: (f[k][-1], k))
+    sizes, j = [], nb - 1
+    while k:
+        i = arg[k][j]
+        sizes.append(int(B[j] - B[i]))
+        j, k = i, k - 1
+    return sizes[::-1]
+
+
+def cell_lists(splats, partition, *, eps: float = 1e-8, layout=None,
+               headroom: float = 2.0, margin: int = 64, n_sp_buckets: int = 8, align: int = 8):
+    """Per-cell significant splats at FIXED shapes — rebuilt on the refresh cadence.
+
+    Each point group's cells are ranked by their significant-splat count and cut into at most
+    ``n_sp_buckets`` lists, at the sizes that minimize the padded work Σ cells x width; a list's
+    width is ``headroom`` x its widest cell + ``margin``, rounded up to a multiple of ``align``
+    (masked slots). ``layout`` (``[(cells, width)]`` per list, the previous build's) pins the shapes
+    for the whole run, so the step compiles once. A cell past its width raises
+    :class:`CellOverflow`: truncating would drop density silently.
+
+    Carries :func:`cell_partition`'s leading DEVICE axis through: point indices are local to a
+    device block, splat indices are global (the splats are replicated, only the grid is sharded).
+    Shapes are the max over every device, so all devices trace one shape.
+
+    Built on the splats' device, one compiled call per point group (the host only cuts the sizes at
+    the first build); the host build was most of a refresh (0.83 of 0.85 s at chignolin, M 3354).
+
+    Returns the lists and their layout.
+    """
+    mu = splats.centers
+    rcut = jnp.asarray(_host_rcut(splats, eps))
+    M = int(mu.shape[0])
+    width = lambda n: _align(min(M, int(np.ceil(max(1, n) * headroom)) + margin), align)
+    todo = None if layout is None else list(layout)
+    groups, out, over = [], [], []
+    for (pi, pm), (c, R) in zip(partition, partition.geom):
+        ndev, nc = pi.shape[:2]
+        live = pm.any(-1)
+        # Cells ranked by count and cut at FIXED sizes, so every refresh emits the same shapes as
+        # membership churns; without the split S is the worst cell of the whole point group.
+        if todo is None:
+            srt = np.sort(np.asarray(_counts(c, R, live, mu, rcut)), axis=1)
+            shapes, lo = [], 0
+            for n in _cut(srt.max(0), n_sp_buckets, width):
+                shapes.append((n, width(int(srt[:, lo:lo + n].max()))))
+                lo += n
+        else:
+            shapes, tot = [], 0
+            while tot < nc:
+                shapes.append(tuple(int(x) for x in todo.pop(0)))
+                tot += shapes[-1][0]
+        lists, want = _lists(c, R, live, pi, pm, mu, rcut, tuple(shapes))
+        for (n, S), w, g in zip(shapes, np.asarray(want), lists):
+            if w > S:
+                over.append((len(out), int(w), S))
+            groups.append(g)
+            out.append((n, S))
+    if over:
+        b, want, S = max(over, key=lambda o: o[1] - o[2])
+        raise CellOverflow(
+            f"cell lists overflow: {len(over)} of {len(out)} lists have a cell past their fixed "
+            f"width (worst: list {b}, {want} significant splats > width {S}); the widths are fixed "
+            f"at the first build, so raise cellgrid(headroom=..., margin=...)")
+    return tuple(groups), out
+
+
+def _eval(params, pts):
+    """g (n,m) and t = A(r − μ) by component, the dense block's expressions; ∇g = −2 t g is never
+    formed."""
+    A, ce, no = params
+    dx = pts[:, None, 0] - ce[None, :, 0]
+    dy = pts[:, None, 1] - ce[None, :, 1]
+    dz = pts[:, None, 2] - ce[None, :, 2]
+    a00, a11, a22 = A[None, :, 0, 0], A[None, :, 1, 1], A[None, :, 2, 2]
+    a01, a02, a12 = A[None, :, 0, 1], A[None, :, 0, 2], A[None, :, 1, 2]
+    t = (a00 * dx + a01 * dy + a02 * dz, a01 * dx + a11 * dy + a12 * dz,
+         a02 * dx + a12 * dy + a22 * dz)
+    return no[None, :] * jnp.exp(-(dx * t[0] + dy * t[1] + dz * t[2])), t
+
+
+def _take(x, idx):
+    # Out-of-range rows read 0, and their cotangents drop instead of piling onto row 0.
+    return jnp.take(x, idx, axis=0, mode="fill", fill_value=0)
+
+
+CHUNK_BYTES = 1 << 30           # live bytes per chunk of cells
+
+
+def _chunked(arrays, per_cell, budget):
+    """Cell arrays as (chunks, cells per chunk, ...), padded with empty cells, each chunk within
+    ``budget`` bytes."""
+    nc = int(arrays[0].shape[0])
+    nchunk = -(-nc // max(1, min(nc, budget // max(per_cell, 1))))
+    n = -(-nc // nchunk)
+    pad = nchunk * n - nc
+    return tuple(jnp.concatenate([x, jnp.zeros((pad,) + x.shape[1:], x.dtype)])
+                 .reshape((nchunk, n) + x.shape[1:]) for x in arrays)
+
+
+def _one(sub, Cb, occ, pts, pm, sm):
+    """ρ and ∇ρ on a chunk of cells from its gathered splats ``sub`` (nc, S, ...) and coefficient
+    rows ``Cb`` (nc, S, n_occ)."""
+    g, t = jax.vmap(_eval)(sub, pts)                       # (nc,P,S), 3 x (nc,P,S)
+    g = jnp.where(pm[:, :, None] & sm[:, None, :], g, 0.0)
+    psi = jnp.einsum("cps,cso->cpo", g, Cb)
+    r_c = jnp.sum(occ[None, None, :] * psi ** 2, axis=-1)
+    # ∇ρ = 2 Σ_i w_i ∇g_i, w = Σ_o occ_o ψ_o C_io, with ∇g = −2 t g: reductions over the splats
+    # of (w g) t_k, so neither (nc,P,S,3) nor (nc,P,n_occ,3) is formed.
+    h = jnp.einsum("o,cpo,cso->cps", occ, psi, Cb) * g
+    return r_c, -4.0 * jnp.stack([jnp.sum(h * tk, -1) for tk in t], -1)
+
+
+def _gathered(q, C, grid_points, pi, si, sm):
+    """A chunk's points, splats and coefficient rows; padded slots point past the end and read 0."""
+    si = jnp.where(sm, si, C.shape[0])
+    return si, grid_points[pi], tuple(_take(x, si) for x in q), _take(C, si)
+
+
+def _groups(cells, n_occ, budget):
+    """Each list's cells as chunks within ``budget`` bytes: ``(pi, pm, si, sm)``, (chunks, n, ...)."""
+    return [_chunked(group, 8 * (8 * group[0].shape[-1] * group[2].shape[-1]
+                                 + (group[0].shape[-1] + group[2].shape[-1]) * n_occ), budget)
+            for group in cells]
+
+
+@functools.partial(jax.jit, static_argnames="budget")
+def cell_density_and_grad(splats, C, occ, grid_points, cells, budget=CHUNK_BYTES):
+    """ρ(r), ∇ρ(r) by batched evaluation over fine cells, ``budget`` live bytes of cells at a time.
+    Equals the dense path to the ``eps`` tail."""
+    return _cell_density(full_quantities(splats), C, occ, grid_points, cells, budget)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5,))
+def _cell_density(q, C, occ, grid_points, cells, budget):
+    """The cell loop, with its own reverse: one pass over the same chunks that recomputes each
+    chunk and adds its cotangents into ONE running total per input, in place. Autodiff of the loop
+    gave each of the ~36 lists its own dense (M, n_occ) cotangent of C, all live until summed: about
+    ten (M, n_occ) arrays per device at insulin, the step's largest floor once the RI-J stream was
+    tiled."""
+    n_pts = grid_points.shape[0]
+    rho = jnp.zeros(n_pts)
+    grad = jnp.zeros((n_pts, 3))
+    for pi, pm, si, sm in _groups(cells, C.shape[1], budget):
+        def chunk(a):
+            pi_, pm_, si_, sm_ = a
+            _, pts, sub, Cb = _gathered(q, C, grid_points, pi_, si_, sm_)
+            return _one(sub, Cb, occ, pts, pm_, sm_)
+
+        r_c, g_c = lax.map(chunk, (pi, pm, si, sm))
+        P = pi.shape[-1]
+        pi, pm = pi.reshape(-1, P), pm.reshape(-1, P)
+        # Padded points scatter past the end, each to its own index (dropped): a real point is in
+        # one cell, so the indices are unique and nothing piles onto point 0.
+        dst = jnp.where(pm, pi, n_pts + jnp.arange(pi.size, dtype=pi.dtype).reshape(pi.shape))
+        rho = rho.at[dst].add(r_c.reshape(-1, P), mode="drop", unique_indices=True)
+        grad = grad.at[dst].add(g_c.reshape(-1, P, 3), mode="drop", unique_indices=True)
     return rho, grad
+
+
+def _cell_density_fwd(q, C, occ, grid_points, cells, budget):
+    return _cell_density(q, C, occ, grid_points, cells, budget), (q, C, occ, grid_points, cells)
+
+
+def _cell_density_bwd(budget, res, cts):
+    q, C, occ, grid_points, cells = res
+    rho_bar, grad_bar = cts
+    z = lambda x: jnp.zeros(jnp.shape(x), jnp.result_type(x))   # zeros_like would carry a mesh sharding into shard_map
+    acc = (tuple(z(x) for x in q), z(C), z(occ), z(grid_points))
+    for pi, pm, si, sm in _groups(cells, C.shape[1], budget):
+        def body(acc, a):
+            pi_, pm_, si_, sm_ = a
+            si_, pts, sub, Cb = _gathered(q, C, grid_points, pi_, si_, sm_)
+            _, vjp = jax.vjp(lambda s, c, o, x: _one(s, c, o, x, pm_, sm_), sub, Cb, occ, pts)
+            rb = jnp.where(pm_, _take(rho_bar, pi_), 0.0)                    # (nc, P)
+            gb = jnp.where(pm_[..., None], _take(grad_bar, pi_), 0.0)        # (nc, P, 3)
+            d_sub, d_Cb, d_o, d_pts = vjp((rb, gb))
+            a_q, a_C, a_o, a_x = acc
+            # straight into the running totals, in place; padded slots (index M) drop
+            return (tuple(a.at[si_].add(d, mode="drop") for a, d in zip(a_q, d_sub)),
+                    a_C.at[si_].add(d_Cb, mode="drop"), a_o + d_o,
+                    a_x.at[pi_].add(jnp.where(pm_[..., None], d_pts, 0.0), mode="drop")), None
+
+        acc = lax.scan(body, acc, (pi, pm, si, sm))[0]
+    d_q, d_C, d_o, d_x = acc
+    return d_q, d_C, d_o, d_x, None
+
+
+_cell_density.defvjp(_cell_density_fwd, _cell_density_bwd)

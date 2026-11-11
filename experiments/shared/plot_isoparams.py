@@ -17,7 +17,7 @@ from experiments.common.style import (apply as apply_style, PAPER_FIG_HEIGHT_IN,
                                        save_at_height)
 
 FIG_H = PAPER_FIG_HEIGHT_IN * 0.92   # ONE row, with the band above the panels closed
-_USETEX = apply_style(nrows=1, ncols=3, rel_width=1.0, height_in=FIG_H)
+_USETEX = False                      # set by main, which sizes the style to its panels
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "..", "..", "data", "figures", "fig5_isoparams.csv")
@@ -132,17 +132,37 @@ def _basis_data(system, nao):
     return _BD[(system, basis)]
 
 
-def main(logdir=RESULTS):
+def _nocc(name):
+    """Doubly occupied orbitals of a closed-shell system."""
+    return int(systems.molecule(system=name, basis="cc-pvdz").nelectron) // 2   # any basis
+
+
+def main(logdir=RESULTS, names=("water", "ethanol", "alanine_dipeptide"), titles=None, out=None,
+         ncols=None, height_in=None, xlim=None):
+    """One panel per system of ``names`` that has a CBS limit, from the CSV (or log directory)
+    ``logdir``; ``titles`` maps a system to its panel title; the figure goes to ``out``.pdf/.png.
+    ``ncols`` wraps the panels into rows of that many (one row by default); ``height_in`` overrides
+    the figure height and ``xlim`` every panel's x range."""
+    global _USETEX
     data = ladder.load(logdir, budget=BUDGET)
-    present = ladder.systems_with_cbs(data)
-    missing = [s for s in ("water", "ethanol", "alanine_dipeptide") if s not in present]
+    present = ladder.systems_with_cbs(data, order=names)
+    missing = [s for s in names if s not in present]
     if missing:
         print(f"  no CBS, panel omitted: {', '.join(missing)}")
-    fig, axes = plt.subplots(1, len(present), squeeze=False)
-    axes = axes[0]
+    if not present:
+        print("  no system has a CBS limit yet; no figure")
+        return
+    ncols = min(ncols or len(present), len(present))
+    nrows = -(-len(present) // ncols)
+    fig_h = height_in or FIG_H * nrows
+    _USETEX = apply_style(nrows=nrows, ncols=ncols, rel_width=1.0, height_in=fig_h)
+    fig, axes = plt.subplots(nrows, ncols, squeeze=False)
+    axes = axes.ravel()
+    for ax in axes[len(present):]:
+        ax.set_visible(False)
     for ci, sysn in enumerate(present):
         ax = axes[ci]
-        no = NOCC[sysn]
+        no = NOCC.get(sysn) or _nocc(sysn)
         gl = ladder.gto_ladder(data[sysn])
         gx = [resources.gto_params(_basis_data(sysn, B), B, no)["total"] for B, _ in gl]
         gy = [g for _, g in gl]                      # already (E - gto CBS)*1e3
@@ -209,18 +229,22 @@ def main(logdir=RESULTS):
         if leg_exp is not None:
             leg_exp.set_zorder(8)
             ax.add_artist(leg_exp)
-        ax.xaxis.set_major_locator(
-            matplotlib.ticker.LogLocator(base=10.0, subs=(1.0, 2.0, 5.0), numticks=6))
+        ax.xaxis.set_major_locator(   # decades only
+            matplotlib.ticker.LogLocator(base=10.0, subs=(1.0,), numticks=6))
         ax.xaxis.set_major_formatter(matplotlib.ticker.LogFormatterSciNotation(labelOnlyBase=False))
         ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-        _l = "abcdefgh"[ci]
+        if xlim:
+            ax.set_xlim(*xlim)
+        _l = "abcdefghijkl"[ci]
         tag = rf"\textbf{{{_l})}}" if _USETEX else rf"$\mathbf{{{_l}}}$)"
-        ax.set_xlabel("Free parameters")
-        ax.set_title(f"{tag} {TITLE[sysn]}", fontsize=7, pad=2.0)   # default pad opens a gap
+        if ci + ncols >= len(present):          # the x label only where no panel sits below
+            ax.set_xlabel("Free parameters")
+        ax.set_title(f"{tag} {(titles or TITLE).get(sysn, sysn)}", fontsize=7, pad=2.0)   # default pad opens a gap
         ax.tick_params(axis="x", which="minor", labelsize=4)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
-    axes[0].set_ylabel(r"$\Delta$ (mHa)")
+    for ax in axes[:len(present):ncols]:
+        ax.set_ylabel(r"$\Delta$ (mHa)")
     h_main = [Line2D([0], [0], color="#9a9a9a", marker="o", ls="-", ms=3, lw=1.0, label="cc-pVXZ"),
               Line2D([0], [0], color="#5b2d91", marker="s", ls="-", ms=3, lw=1.0, label="Splats")]
     fig.legend(handles=h_main, fontsize=6, frameon=False, ncol=2, loc="lower center",
@@ -228,11 +252,11 @@ def main(logdir=RESULTS):
                # figure and the tight bbox then keeps the empty band between them.
                bbox_to_anchor=(0.5, 1.0), borderaxespad=0.0, handlelength=1.6,
                columnspacing=1.6)
-    fig.tight_layout(h_pad=0.2)
-    fig.subplots_adjust(top=0.90)
-    out = os.path.join(HERE, "isoparams")
-    save_at_height(fig, out + ".png", height_in=FIG_H, dpi=200)
-    save_at_height(fig, out + ".pdf", height_in=FIG_H)
+    fig.tight_layout(h_pad=0.2 if nrows == 1 else 1.4)
+    fig.subplots_adjust(top=1.0 - 0.10 / nrows, **({} if nrows == 1 else {"hspace": 0.75}))
+    out = out or os.path.join(HERE, "isoparams")
+    save_at_height(fig, out + ".png", height_in=fig_h, dpi=200)
+    save_at_height(fig, out + ".pdf", height_in=fig_h)
     print("wrote", out)
 
 

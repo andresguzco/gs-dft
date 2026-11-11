@@ -1,0 +1,7 @@
+system,n_atoms,G,peak_gpu_mb_dev,aot_temp_gib,aot_args_gib,step_med_s,oom,run
+fmodb_insulin,947,1,19354,11.84,4.49,178.47881324,False,lean5
+fmodb_insulin,947,2,10426/9623,5.54,2.43,80.06894880,False,lean5
+fmodb_insulin,947,4,7111/6527/6527/6527,3.82,1.36,47.62206626,False,lean5
+fmodb_spectrin_ch,1755,1,53238,17.71,14.67,620.65126811,False,lean5
+fmodb_spectrin_ch,1755,2,28084/23939,11.21,7.82,281.22752364,False,lean5
+fmodb_spectrin_ch,1755,4,18408/17125/17125/17125,8.67,4.40,161.57347890,False,lean5

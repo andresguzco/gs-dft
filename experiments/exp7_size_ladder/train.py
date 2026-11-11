@@ -9,7 +9,7 @@ normalized splat overlap and the smallest eigenvalue of the orbital Gram matrix:
     uv run python -m experiments.exp7_size_ladder.train experiment=exp7_train system=ala_15 steps=1500
 
 ``resume=true`` continues from ``<tag>_ckpt.eqx`` and appends to the JSONL, so a run can span
-several allocations. ``collapse=true`` saves the last good and the first non-finite state and stops.
+several allocations.
 ``DFTAX_AOT_ANALYZE=1`` compiles the step without running it and prints its memory footprint.
 """
 import math
@@ -95,7 +95,6 @@ def main(cfg: DictConfig) -> None:
             jfh.write(m)
             wb.log(m, step=m["step"])
 
-    collapse_ckpt = os.path.join(ckpt_dir, f"{tag}_collapse") if cfg.collapse else None
     # `jax.devices()` is the GLOBAL list under multi-controller, so ONE mesh spans every node.
     # Gate on the global count: a 2-node x 1-GPU run has local_device_count() == 1 and still needs
     # a mesh.
@@ -107,8 +106,7 @@ def main(cfg: DictConfig) -> None:
     xc = xc_of(cfg.xc)
     grid = native_grid(mol, cfg.grid_level, chunk=int(cfg.get('grid_chunk', 4096)))
     ks = SplatKS(mol, xc, grid=grid, coulomb=df(lam=cfg.df_lam, scales=_scales, chunk=int(cfg.get('gamma_chunk', 512))),
-                 screen=pairlist(eps=1e-7, unique=bool(cfg.get('screen_unique', False)),
-                                 skip_pad=bool(cfg.get('skip_pad', False))), mesh=mesh)
+                 screen=pairlist(eps=1e-7), mesh=mesh)
     _resuming = (bool(cfg.resume) and os.path.exists(ckpt + ".eqx")
                  and os.path.exists(ckpt + ".step"))
     if cfg.init_c != "random" and _resuming:
@@ -169,7 +167,7 @@ def main(cfg: DictConfig) -> None:
                 monitor=monitor(cfg.monitor, cond_every=cfg.cond_every),
                 step_cb=step_cb,
                 checkpoint=ckpt_spec(ckpt, every=cfg.ckpt_every, resume=cfg.resume),
-                guard=(collapse(collapse_ckpt, nelec_rtol=float(cfg.nelec_rtol)) if collapse_ckpt else None))
+                guard=collapse(nelec_tol_per_atom=float(cfg.nelec_tol_per_atom)))
 
     if jfh is not None:
         jfh.close()

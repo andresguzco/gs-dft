@@ -92,11 +92,18 @@ def auto_screen(M, *, force=False):
     return bool(force or M >= 300)
 
 
-def use_cells(M, force=False):
-    """Block-sparse Morton-cell grid density — **OFF by default; opt in with ``force``.**
+CELLS_FROM_ATOMS = 30
+"""Atoms from which the grid density goes by Morton cells (dense below); see :func:`use_cells`."""
 
-    TODO: vectorize `cell_lists` and cut the ``(nc,P,S)`` peak, then enable this by size."""
-    return bool(force)
+
+def use_cells(mol, xc):
+    """Whether :func:`splat_ks` takes the grid density by Morton cells: from
+    :data:`CELLS_FROM_ATOMS` atoms, and not for a meta-GGA (the cells have no τ).
+
+    Measured on one A100, grid level 3, the XC term's fwd+bwd, dense -> cells: ethanol (9 atoms,
+    M 144) 11.6 -> 13.1 ms and +77 s of compile; penicillin (41, M 832) 230 -> 60 ms; chignolin
+    (168, M 1677) 2762 -> 265 ms, the whole step 3.55 -> 1.04 s."""
+    return len(mol.atom_coords()) >= CELLS_FROM_ATOMS and xc.xc_type != "MGGA"
 
 
 AUX_LADDER = {1: (1.0,), 2: (0.7, 1.4), 3: (0.5, 1.0, 2.0), 5: (0.25, 0.5, 1.0, 2.0, 4.0)}
@@ -115,18 +122,55 @@ def aux_scales(mult):
     return AUX_LADDER[m]
 
 
-def splat_ks(mol, xc, *, grid_level, screened, chunk=4096, cells=False, df_lam=1e-8,
-             aux_mult=1, screen_pad=SCREEN_PAD, gamma_chunk=512):
+def shardable(xc):
+    """Whether ``xc`` runs on the sharded (mesh) step: pure, not meta-GGA, no VV10."""
+    from gs_dft.ks.terms import hf_coeff
+    return (hf_coeff(xc) == 0.0 and float(getattr(xc, "hf_coeff_lr", 0.0) or 0.0) == 0.0
+            and xc.xc_type != "MGGA" and not has_nlc(xc))
+
+
+def splat_ks(mol, xc, *, grid_level, screened, chunk=4096, cells=None, df_lam=1e-8,
+             aux_mult=1, screen_pad=SCREEN_PAD, gamma_chunk=512, G=1):
     """The production SplatKS every splat runner builds: native Becke grid + DF Coulomb, screened
     pairs when ``screened`` (grid chunked only then — the dense path takes the whole grid at once).
 
-    ``cells`` (from :func:`use_cells`) swaps the grid density for the block-sparse Morton-cell path.
-    Energy-identical and mesh-safe; default False so existing callers are unchanged."""
+    Screened, a functional the mesh supports runs the sharded step on the first ``G`` devices, G=1
+    included, so every device count runs one code path. Pairs are unique with the padding skipped
+    for pure functionals, ordered for hybrids (``pairlist``'s defaults). A functional the mesh does
+    not support runs on one device and raises for G > 1.
+
+    ``cells`` is the grid density's path: ``None`` by :func:`use_cells`, True (``cellgrid()``) or a
+    ``cellgrid(...)`` spec for the Morton cells, False for dense."""
+    from gs_dft.ks.shard import make_mesh
+    mesh = None
+    if screened and shardable(xc):
+        mesh = make_mesh(int(G))
+    elif int(G) != 1:
+        raise ValueError(f"G={G}: the sharded step needs screened=True and a pure, non-meta-GGA "
+                         f"functional without VV10; {type(xc).__name__} runs on one device only")
     return SplatKS(mol, xc,
                    grid=native_grid(mol, grid_level, chunk=chunk if screened else None),
                    coulomb=df(lam=float(df_lam), scales=aux_scales(aux_mult), chunk=int(gamma_chunk)),
                    screen=pairlist(eps=1e-7, pad=float(screen_pad)) if screened else None,
-                   cells=cellgrid() if cells else None)
+                   cells=_cell_spec(use_cells(mol, xc) if cells is None else cells), mesh=mesh)
+
+
+def _cell_spec(cells):
+    """``splat_ks``'s ``cells`` as a SplatKS argument: a spec, or None for the dense path."""
+    from gs_dft.ks.terms import CellGrid
+    if isinstance(cells, CellGrid):
+        return cells
+    return cellgrid() if cells else None
+
+
+def run_fields(ks, res):
+    """A finished run's guard and exploit diagnostics as RESULT fields: why it stopped, the last grid
+    electron error per atom, and the per-splat grid norms of the final model."""
+    from gs_dft.ks.diagnostics import grid_norm_fields
+    out = {"stop": res.stop_reason or "none",
+           "nelec_err_per_atom": float(res.nelec_err[-1]) if len(res.nelec_err) else float("nan")}
+    out.update(grid_norm_fields(ks, res.model))
+    return out
 
 
 GRID_CONVERGED_MHA = 0.1

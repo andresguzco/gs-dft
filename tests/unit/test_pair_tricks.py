@@ -189,8 +189,9 @@ def test_splatks_unique_skip_pad_parity(mesh_on):
         pytest.skip("needs XLA_FLAGS=--xla_force_host_platform_device_count=4")
     from gs_dft.ks import shard as shd
     mesh = shd.make_mesh() if mesh_on else None
-    ks0, model = _water_ks(mesh)
-    ks1, _ = _water_ks(mesh, unique=True, skip_pad=True)
+    ks0, model = _water_ks(mesh, unique=False, skip_pad=False)
+    ks1, _ = _water_ks(mesh)                                  # the defaults: unique, padding skipped
+    assert ks1.screen.unique and ks1.screen.skip_pad
     G = int(mesh.size) if mesh is not None else 1
     n_ord = int(scr.neighbor_pairs(model.basis, eps=1e-6)[0].shape[0])
     n_uni = int(scr.neighbor_pairs(model.basis, eps=1e-6, unique=True)[0].shape[0])
@@ -257,23 +258,12 @@ def test_count_matches_the_built_list():
             assert n == int(pi.shape[0]), f"count {n} != built {int(pi.shape[0])} (unique={unique})"
 
 
-def test_overflow_keeps_the_largest_overlaps_exactly():
-    """The overflow rule is a real sort: with a pad below the significant count, the kept set must be
-    exactly the pad_to largest by |S|, and still lexsorted."""
-    from gs_dft.coulomb.stream import full_quantities
-    from gs_dft.screening.pairs import _count_significant
+def test_overflow_raises_naming_the_pad():
+    """A pad below the significant count raises instead of dropping pairs."""
+    from gs_dft.screening.pairs import PairPadOverflow
     s = _splats(M=40)
-    M, eps = int(s.n_basis), 1e-6
-    n = int(_count_significant(full_quantities(s), M, eps, 16, True))
-    pad = n // 2                                   # force overflow
-    pi, pj, w = scr.neighbor_pairs(s, eps=eps, pad_to=pad, unique=True, row_chunk=16)
-    assert pi.shape[0] == pad and int(np.sum(np.asarray(w) != 0)) == pad
-    got = np.asarray(pi).astype(np.int64) * M + np.asarray(pj)
-    assert np.all(np.diff(got) > 0), "kept pairs are not lexsorted"
-    # brute force: every significant pair, sorted by |S| descending, take pad
-    fi, fj, _ = scr.neighbor_pairs(s, eps=eps, unique=True, row_chunk=16)
-    q = full_quantities(s)
-    v = np.abs(np.asarray(scr._full_overlap_pairs(q, fi, fj)))
-    flat = np.asarray(fi).astype(np.int64) * M + np.asarray(fj)
-    want = np.sort(flat[np.argsort(-v)[:pad]])
-    np.testing.assert_array_equal(got, want)
+    n = scr.count_pairs(s, eps=1e-6, unique=True, row_chunk=16)
+    with pytest.raises(PairPadOverflow, match=f"pad of {n // 2}"):
+        scr.neighbor_pairs(s, eps=1e-6, pad_to=n // 2, unique=True, row_chunk=16)
+    pi, _pj, _w = scr.neighbor_pairs(s, eps=1e-6, pad_to=n, unique=True, row_chunk=16)   # exactly full
+    assert pi.shape[0] == n

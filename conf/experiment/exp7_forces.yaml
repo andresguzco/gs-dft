@@ -16,7 +16,6 @@ polish_lr: 0.0                # set to the constant lr the checkpoint finished u
 monitor: 25
 grid_check: 4
 cond_every: 0
-collapse: true
 
 ckpt: null
 ckpt_every: 50

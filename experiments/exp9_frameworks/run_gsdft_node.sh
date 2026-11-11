@@ -11,6 +11,6 @@ CUDA_VISIBLE_DEVICES="${GPUS%%,*}" "${PY[@]}" -m experiments.exp6_cost_benchmark
 for s in water ethanol alanine_dipeptide ala_5 ala_15 ala_45 insulin; do
   CUDA_VISIBLE_DEVICES="${GPUS:-0,1,2,3}" XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 "${PY[@]}" \
     -m experiments.exp7_size_ladder.train experiment=exp7_train system="$s" tag="${s}_appD" out_dir="$R" \
-    basis=cc-pvtz m_mult=1.0 grid_level=3 steps=100 monitor=10 grid_check=0 collapse=false \
+    basis=cc-pvtz m_mult=1.0 grid_level=3 steps=100 monitor=10 grid_check=0 \
     resume=false > "$R/gsdft_${s}.log" 2>&1
 done

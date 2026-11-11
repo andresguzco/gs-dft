@@ -20,8 +20,8 @@ polish_lr: 0.0                # >0 => constant-lr Adam, to continue a finished r
 monitor: 25
 grid_check: 4
 cond_every: 0                 # cond(V) of the auxiliary metric every N steps (0 = off)
-nelec_rtol: 1e-3              # stop if the electron count drifts by more than this, relative
-collapse: true                # stop on a non-finite energy or gradient
+nelec_tol_per_atom: 1e-4      # stop once the grid electron error per atom, having been inside this,
+                              # leaves it (the run always stops on a non-finite energy or gradient)
 
 # --- checkpoint / resume ----------------------------------------------------
 ckpt: null                    # null => results/<tag>_ckpt
@@ -34,7 +34,4 @@ tag: null                     # null => <system>_M<m_mult>x_g<grid>_s<seed>
 
 # --- memory -----------------------------------------------------------------
 grid_chunk: 4096              # grid points per chunk of the density evaluation
-screen_unique: true           # store each pair once (j >= i) with a factor 2 off the diagonal
-skip_pad: true                # skip all-padding pair chunks: about 30% faster for about 40% more peak
-                              # memory; turn it off when memory is the limit
 remat: false                  # jax.checkpoint around the whole energy: less memory, slower

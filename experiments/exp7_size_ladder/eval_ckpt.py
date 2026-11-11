@@ -18,7 +18,7 @@ from gs_dft import chem, init_model, nao as nao_of
 from gs_dft import screening as _scr
 from gs_dft.ks.energy import SplatKS
 from gs_dft.ks.terms import df, pairlist
-from gs_dft.ks.train import (_load_ckpt, _partition, _prepare_mesh, _refresh_state,
+from gs_dft.ks.train import (_load_ckpt, _partition, _prepare_mesh, _refresh_state, _pad_of,
                                       native_grid, splat_adam)
 from experiments.common import paths, probes, systems
 from experiments.common.builders import aux_scales, xc_of
@@ -50,8 +50,7 @@ def main(cfg: DictConfig) -> None:
                  grid=native_grid(mol, cfg.grid_level, chunk=int(cfg.get("grid_chunk", 4096))),
                  coulomb=df(lam=cfg.df_lam, scales=aux_scales(cfg.aux_mult),
                             chunk=int(cfg.get("gamma_chunk", 512))),
-                 screen=pairlist(eps=1e-7, unique=bool(cfg.get("screen_unique", False)),
-                                 skip_pad=bool(cfg.get("skip_pad", False))), mesh=mesh)
+                 screen=pairlist(eps=1e-7), mesh=mesh)
 
     ckpt = cfg.ckpt or paths.artifact(out_dir, f"{tag}_ckpt")
     m_tr, m_st = _partition(model)
@@ -65,9 +64,7 @@ def main(cfg: DictConfig) -> None:
 
     ks, model, G, multinode, rank0 = _prepare_mesh(ks, model)
     t0 = time.time()
-    n0 = int(_scr.neighbor_pairs(model.basis, eps=ks.screen.eps,
-                                 unique=bool(cfg.get("screen_unique", False)))[0].shape[0])
-    pad_to = -(-int(ks.screen.pad * n0) // G) * G
+    pad_to, _n0 = _pad_of(ks, model.basis, G)
     state = _refresh_state(ks, model.basis, pad_to, multinode)
     m_tr, m_st = _partition(model)
 

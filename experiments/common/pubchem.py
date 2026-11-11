@@ -21,6 +21,15 @@ SYSTEMS: dict[str, dict] = {
     # anywhere in the exp2 accuracy ladder — that is deliberate, and it is the point of the system.
     "penicillin": {"cid": 5904, "formula": "C16H18N2O4S", "n_atoms": 41, "charge": 0, "spin": 0,
                    "note": "penicillin G / benzylpenicillin, neutral acid form"},
+    # The rebuttal's accuracy ladders (experiments/rebuttal), fetched 2026-11-06.
+    "cubane": {"cid": 136090, "formula": "C8H8", "n_atoms": 16, "charge": 0, "spin": 0,
+               "note": "strained cubic cage"},
+    "porphine": {"cid": 66868, "formula": "C20H14N4", "n_atoms": 38, "charge": 0, "spin": 0,
+                 "note": "free-base porphyrin, aromatic macrocycle"},
+    "retinal": {"cid": 638015, "formula": "C20H28O", "n_atoms": 49, "charge": 0, "spin": 0,
+                "note": "all-trans retinal, conjugated polyene chromophore"},
+    "cholesterol": {"cid": 5997, "formula": "C27H46O", "n_atoms": 74, "charge": 0, "spin": 0,
+                    "note": "the archetypal steroid, rigid fused rings"},
 }
 
 

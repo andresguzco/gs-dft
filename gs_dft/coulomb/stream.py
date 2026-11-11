@@ -170,7 +170,8 @@ def _cef_bwd(eri_block_fn, M, unique, bra_chunk, res, g):
     pis, pjs, n = _chunked_pairs(pi, pj, bra_chunk)
     pad = pis.size - n
     Pwa = jnp.concatenate([Pw, jnp.zeros(pad)]).reshape(-1, bra_chunk)   # padded bra Pw
-    zero = jax.tree.map(jnp.zeros_like, splats)
+    z = lambda x: jnp.zeros(jnp.shape(x), jnp.result_type(x))   # zeros_like would carry a mesh sharding into shard_map
+    zero = jax.tree.map(z, splats)
 
     def scan_body(acc, carry):
         bi, bj, pwa = carry
@@ -293,28 +294,40 @@ def full_coulomb_energy(splats, P, bra_chunk=64, unique=True):
 #  The density-fitting-FREE Coulomb: O(M²) compute, O(bra_chunk·n_pair) memory.
 # ---------------------------------------------------------------------------
 
-def screened_coulomb_energy(splats, C_orth, occ, pi, pj, valid=None, bra_chunk=128):
+def screened_coulomb_energy(splats, C_orth, occ, pi, pj, valid=None, bra_chunk=128, ket_chunk=16384):
     """EXACT Hartree energy ``E_J = ½ Σ_{a,b ∈ sig pairs} (a|b) P_a P_b`` over the significant overlap
-    pairs — the screened, density-fitting-FREE streaming analog of ``coulomb_energy_fused``.
+    pairs — the screened, density-fitting-FREE streaming analog of ``coulomb_energy_fused``, on the
+    fused (pair|pair) kernel (:func:`_fused_block`, ``_N_FUSED_NODES`` Boys-scaled nodes).
 
-    ``neighbor_pairs`` returns ALL ordered significant pairs (incl. the diagonal), so the symmetry
-    weight is 1 and ``P_a = P[i_a,j_a] = Σ_o occ_o C_{i_a o} C_{j_a o}`` (no dense M×M P). The bra
-    pairs are streamed in chunks against the full significant ket list; ``jax.checkpoint`` on the
-    chunk body bounds the backward to O(bra_chunk·n_pair) memory. Total compute is O(n_pair²)=O(M²)
-    (the long-range 1/r forbids ket screening — only the significant pair COUNT, O(M²)→O(M), drops).
+    ``P_a = P[i_a,j_a] = Σ_o occ_o C_{i_a o} C_{j_a o}`` (no dense M×M P), times ``valid`` (0 on
+    padding; the 2−δ_ij weights on a unique list). The ket side's pair pieces are built once and
+    read in blocks of ``ket_chunk`` (padded with copies of the first pair at zero weight); bra pairs
+    are streamed in chunks of ``bra_chunk``, so the peak is one (bra_chunk, ket_chunk) block whatever
+    the pair count. Total compute is O(n_pair²)=O(M²) (the long-range 1/r forbids ket screening —
+    only the significant pair COUNT, O(M²)→O(M), drops).
 
     Equals the dense exact ``E_J`` when (pi,pj) is the full ordered set (``neighbor_pairs`` with
-    ``eps<0``); ε-controlled (overlap screening) otherwise. ``valid`` zeroes padded pairs.
+    ``eps<0``); ε-controlled (overlap screening) otherwise.
     """
-    block_fn = full_eri_block_schur
+    q = full_quantities(splats)
     Pw = jnp.sum(occ[None, :] * C_orth[pi] * C_orth[pj], axis=1)        # P_ij on the pairs (n_pair,)
     if valid is not None:
-        Pw = valid.astype(Pw.dtype) * Pw           # 0 on padding; 2−δ_ij weights on a unique list
+        Pw = valid.astype(Pw.dtype) * Pw
+    kc = int(min(ket_chunk, pi.shape[0]))
+    pad = (-pi.shape[0]) % kc
+    blocks = lambda x: jnp.concatenate([x, jnp.repeat(x[:1], pad, axis=0)]).reshape(-1, kc, *x.shape[1:])
+    ket = jax.tree.map(blocks, _fused_side(q, pi, pj))
+    Pk = jnp.concatenate([Pw, jnp.zeros(pad, Pw.dtype)]).reshape(-1, kc)
     pis, pjs, n = _chunked_pairs(pi, pj, bra_chunk)
 
     def body(c):
-        block = block_fn(splats, c[0], c[1], pi, pj)                    # (bra_chunk, n_pair)
-        return block @ Pw                                              # Jvec chunk (bra_chunk,)
+        bra = _fused_side(q, c[0], c[1])
+
+        def over_ket(acc, kb):
+            sk, pk = kb
+            return acc + _fused_block(bra, sk, _N_FUSED_NODES) @ pk, None
+
+        return lax.scan(over_ket, jnp.zeros(c[0].shape[0], Pw.dtype), (ket, Pk))[0]
 
     jv = lax.map(jax.checkpoint(body), (pis, pjs)).reshape(-1)[:n]      # Jvec on pairs (n_pair,)
     return 0.5 * jnp.sum(jv * Pw)
@@ -335,7 +348,10 @@ def screened_coulomb_energy(splats, C_orth, occ, pi, pj, valid=None, bra_chunk=1
 #  realistic anisotropy (48: 1e-9); extreme aspect ratios (e^9) converge only algebraically.
 # ---------------------------------------------------------------------------
 
-_N_FUSED_NODES = 32     # measured: 2e-8 (isotropic, exact Boys) / 4e-7 (aspect ~e^1.5) at 32; 2e-9 at 48
+# Per integral: 2e-8 (isotropic) / 4e-7 (aspect ~e^1.5) at 32 nodes, 2e-9 at 48. E_J of penicillin
+# (M=416) against the unscreened Schur form: −14.6 µHa at 32 nodes; 48 is within 0.03 µHa of 64
+# (experiments/kernels/check_evaluate.py).
+_N_FUSED_NODES = 64
 
 
 def _boys_nodes(n):
@@ -360,8 +376,9 @@ def _make_pairpair_nodes(n):
         for c, e in zip(cs_, es_):
             s = rho * c
             D = ((s + I1) * s + I2) * s + I3
-            expo = s * (q0 + s * (q1 + s * q2)) / D
-            acc = acc + e * jnp.exp(-expo) / jnp.sqrt(D)
+            rD = lax.rsqrt(D)                          # 1/D = rD², no float64 division
+            expo = s * (q0 + s * (q1 + s * q2)) * (rD * rD)
+            acc = acc + e * jnp.exp(-expo) * rD
         return acc
 
     def fwd(I1, I2, I3, q0, q1, q2, rho):
@@ -373,10 +390,11 @@ def _make_pairpair_nodes(n):
         for c, e in zip(cs_, es_):
             s = rho * c
             D = ((s + I1) * s + I2) * s + I3
-            invD = 1.0 / D
+            rD = lax.rsqrt(D)
+            invD = rD * rD
             N = q0 + s * (q1 + s * q2)
             expo = s * N * invD
-            f = g * e * jnp.exp(-expo) * jnp.sqrt(invD)
+            f = g * e * jnp.exp(-expo) * rD
             fe = -f                                    # ∂f/∂expo
             fD = -0.5 * f * invD                       # ∂f/∂D
             e_N = s * invD                             # ∂expo/∂N
@@ -403,15 +421,18 @@ def _sym6(A):
     return (A[..., 0, 0], A[..., 1, 1], A[..., 2, 2], A[..., 0, 1], A[..., 0, 2], A[..., 1, 2])
 
 
-def full_eri_block_fused(splats, bra_i, bra_j, ket_i, ket_j, n_nodes=_N_FUSED_NODES):
-    """(a|b) block for full-covariance splats — the fused scalar kernel (see the module note above).
-    Equals :func:`full_eri_block_schur` to quadrature accuracy; one elementwise fusion per block."""
-    q = full_quantities(splats)
-    Aa, Pa, KNa = _full_pair_quantities(q, bra_i, bra_j)
-    Ab, Pb, KNb = _full_pair_quantities(q, ket_i, ket_j)
-    detAa, detAb = det3(Aa), det3(Ab)
-    axx, ayy, azz, axy, axz, ayz = (v[:, None] for v in _sym6(Aa))
-    bxx, byy, bzz, bxy, bxz, byz = (v[None, :] for v in _sym6(Ab))
+def _fused_side(q, pi, pj):
+    """Per-pair pieces the fused kernel reads: Â's six entries, det Â, the centre and N_iN_jK."""
+    A, P, KN = _full_pair_quantities(q, pi, pj)
+    return _sym6(A), det3(A), P, KN
+
+
+def _fused_block(sa, sb, n_nodes):
+    """(a|b) from the two sides' :func:`_fused_side` pieces — one elementwise fusion."""
+    Aa6, detAa, Pa, KNa = sa
+    Ab6, detAb, Pb, KNb = sb
+    axx, ayy, azz, axy, axz, ayz = (v[:, None] for v in Aa6)
+    bxx, byy, bzz, bxy, bxz, byz = (v[None, :] for v in Ab6)
     # S = Â_a + Â_b, its adjugate and determinant (symmetric)
     sxx, syy, szz, sxy, sxz, syz = axx + bxx, ayy + byy, azz + bzz, axy + bxy, axz + bxz, ayz + byz
     Jxx = syy * szz - syz * syz
@@ -456,3 +477,11 @@ def full_eri_block_fused(splats, bra_i, bra_j, ket_i, ket_j, n_nodes=_N_FUSED_NO
     acc = _make_pairpair_nodes(int(n_nodes))(I1, I2, I3, q0, q1, q2, rho)
     pref = 2.0 * jnp.pi ** 3 / jnp.sqrt(jnp.pi)
     return (KNa[:, None] * KNb[None, :]) * pref * jnp.sqrt(rho * invS) * acc
+
+
+def full_eri_block_fused(splats, bra_i, bra_j, ket_i, ket_j, n_nodes=None):
+    """(a|b) block for full-covariance splats — the fused scalar kernel (see the module note above).
+    Equals :func:`full_eri_block_schur` to quadrature accuracy; one elementwise fusion per block."""
+    q = full_quantities(splats)
+    return _fused_block(_fused_side(q, bra_i, bra_j), _fused_side(q, ket_i, ket_j),
+                        _N_FUSED_NODES if n_nodes is None else n_nodes)

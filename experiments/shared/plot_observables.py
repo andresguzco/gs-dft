@@ -45,7 +45,7 @@ ROW_TAG = ["CBS", "ISC"]
 LINTHRESH = 0.1   # mHa/atom; symlog linear zone on the energy panels
 
 
-FIG_H = PAPER_FIG_HEIGHT_IN * 1.45   # two rows
+FIG_H = PAPER_FIG_HEIGHT_IN * 1.65   # two rows
 HA_BOHR_TO_MEV_A = 51422.08     # (27.211386 eV/Ha) / (0.529177 A/Bohr), x1000
 
 

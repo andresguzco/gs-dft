@@ -83,11 +83,12 @@ class Pairlist:
     # trajectory-length assumption, not a performance knob. Significant pairs grow up to ~1.85x
     # over 12k steps, rising with system size; lowering it truncates the list mid-run.
     pad: float = SCREEN_PAD
-    # j >= i only, with (2 − δ_ij) weights: halves every pair stream (PBE-class only — the screened
-    # RI-K contraction is not symmetric in the pair index).
-    unique: bool = False
+    # j >= i only, with (2 − δ_ij) weights: halves every pair stream. None = by the functional:
+    # unique for pure ones, ordered for hybrids (the screened RI-K contraction is not symmetric in
+    # the pair index); SplatKS resolves it.
+    unique: bool | None = None
     # Skip all-padding pair chunks in the streams (the pad is appended, so the tail is dummy).
-    skip_pad: bool = False
+    skip_pad: bool = True
 
 
 def exact(*, chunk: int | None = None) -> ExactSpec:
@@ -124,19 +125,22 @@ def df(*, scales: tuple = (1.0,), diagonal: bool = True,
                   lam=float(lam), chunk=int(chunk))
 
 
-def pairlist(eps: float = 1e-7, *, pad: float = SCREEN_PAD, unique: bool = False,
-             skip_pad: bool = False) -> Pairlist:
+def pairlist(eps: float = 1e-7, *, pad: float = SCREEN_PAD, unique: bool | None = None,
+             skip_pad: bool = True) -> Pairlist:
     """Screen the one-electron/Coulomb/grid work to the significant-overlap
     pairs (|Ŝ_ij| > ``eps``; ``eps <= 0`` keeps every ordered pair).
 
     Args:
         eps: normalized-overlap cutoff.
         pad: fixed pad multiplier for the list (constant shape ⇒ the jitted
-            step compiles once; overflow keeps the largest-overlap pairs).
-            Must cover pair growth over the whole run, not just drift between
-            refreshes.
+            step compiles once; an overflow raises). Must cover pair growth
+            over the whole run, not just drift between refreshes.
+        unique: store each pair once (j ≥ i, weight 2 off the diagonal);
+            ``None`` = unique for pure functionals, ordered for hybrids.
+        skip_pad: skip the all-padding pair chunks (faster, more peak memory).
     """
-    return Pairlist(eps=float(eps), pad=float(pad), unique=bool(unique), skip_pad=bool(skip_pad))
+    return Pairlist(eps=float(eps), pad=float(pad),
+                    unique=None if unique is None else bool(unique), skip_pad=bool(skip_pad))
 
 
 # ---------------------------------------------------------------------------
@@ -307,13 +311,16 @@ class CellGrid:
     k: int = 5
     cap: int = 1024
     eps: float = 1e-8
-    pt_buckets: int = 4
+    pt_buckets: int = 6
     sp_buckets: int = 8
-    headroom: float = 1.5
+    headroom: float = 2.0
+    margin: int = 64
+    align: int = 8
 
 
-def cellgrid(k: int = 5, *, cap: int = 1024, eps: float = 1e-8,
-             pt_buckets: int = 4, sp_buckets: int = 8, headroom: float = 1.5) -> CellGrid:
+def cellgrid(k: int = 5, *, cap: int = 1024, eps: float = 1e-8, pt_buckets: int = 6,
+             sp_buckets: int = 8, headroom: float = 2.0, margin: int = 64,
+             align: int = 8) -> CellGrid:
     """Block-sparse grid density: fine Morton cells, batched.
 
     The dense path evaluates every splat at every grid point; only ~7% matter. Doing that per
@@ -327,12 +334,22 @@ def cellgrid(k: int = 5, *, cap: int = 1024, eps: float = 1e-8,
         cap: max points per cell. Splits oversized cells into contiguous Morton runs, which also
             tightens occupancy (a sub-run's bounding sphere beats its parent cell's).
         eps: splat cutoff for significance.
-        pt_buckets: point-count buckets, so one dense cell does not pad every other.
-        sp_buckets: significant-splat-count buckets. Load-bearing: with a single bucket ``S`` is
+        pt_buckets: point-count buckets, halving from ``cap``: (cap/2, cap], (cap/4, cap/2], ...,
+            so a cell pads to at most twice its points.
+        sp_buckets: lists per point bucket, at most. Load-bearing: with a single list ``S`` is
             the worst cell in the whole point-bucket and the kernel pads away its own advantage.
-            Cells are rank-ordered and cut at fixed sizes, so shapes stay constant across refreshes.
-        headroom: fixed splat-list width = headroom x the first refresh's max, so the step keeps
-            constant shapes and compiles once; overflow keeps the nearest splats.
+            Cells are rank-ordered by count and cut, at the first build, at the sizes that minimize
+            the padded work; later builds keep the sizes, so shapes stay constant.
+        headroom: fixed splat-list width = headroom x the first refresh's max + ``margin``, so
+            the step keeps constant shapes and compiles once; a refresh past it raises
+            ``CellOverflow``. The lists grow as the splats spread: penicillin from a random init,
+            each point bucket's widest cell 1.2-2.15x (up to +101 splats) over 1000 steps, and
+            a far list 13 -> 43 by step 250 (2.0 x + 16 overflowed there).
+        margin: splats added to every list width, so a list sized from few splats has room too.
+        align: list and point widths rounded up to a multiple of this (masked), for the GEMMs.
     """
+    if int(align) < 1:
+        raise ValueError(f"cellgrid: align must be at least 1, got {align!r}")
     return CellGrid(k=int(k), cap=int(cap), eps=float(eps), pt_buckets=int(pt_buckets),
-                    sp_buckets=int(sp_buckets), headroom=float(headroom))
+                    sp_buckets=int(sp_buckets), headroom=float(headroom), margin=int(margin),
+                    align=int(align))

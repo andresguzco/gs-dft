@@ -20,13 +20,11 @@ import jax
 from jax import lax
 
 from gs_dft.basis.spectral import Splat
-from gs_dft.integrals.linalg3 import det3, adj3
+from gs_dft.integrals.linalg3 import det3
 from gs_dft.coulomb.stream import full_quantities, _full_pair_quantities
 from gs_dft.screening.grid import _host_rcut
 # Laplace half-line quadrature: python floats so the unrolled node loops stay trace-time constants.
 from gs_dft.integrals.dense import _QUAD_T_LIST, _QUAD_W_LIST
-
-_I3 = np.eye(3)          # numpy: importing the package must not initialise the JAX backend
 
 
 def _chunk_pairs(pi, pj, valid, chunk):
@@ -40,8 +38,8 @@ def _chunk_pairs(pi, pj, valid, chunk):
     vc = jnp.concatenate([base_valid, jnp.zeros(pad, bool)]).reshape(-1, chunk)
     return pic, pjc, vc
 
-__all__ = ["neighbor_pairs", "screened_overlap_pairs", "screened_overlap_matvec",
-           "screened_nuclear_pairs", "density_pairs", "screened_external_energy", "pair_weight"]
+__all__ = ["neighbor_pairs", "count_pairs", "PairPadOverflow", "screened_overlap_pairs",
+           "screened_overlap_matvec", "screened_nuclear_pairs", "density_pairs", "screened_external_energy", "pair_weight"]
 
 
 _SENTINEL = jnp.int64(-1)
@@ -58,8 +56,7 @@ def _scan_flat_indices(q, M, eps, pad_to, row_chunk, unique):
     `cap` is derived from the pad rather than typed: the pad is ~2x the live count and the strips
     partition the rows, so `pad_to / n_strips` is the mean occupancy and 4x that is the headroom.
     A strip that exceeds it would silently drop pairs, so the true count is accumulated and
-    `n_over` reports it; the caller falls back to the exact host build. Overflow is the rare path
-    (measured pair fill 0.62), and the fallback is the correctness reference.
+    `n_over` reports it; the caller raises.
 
     Returns ``(keep, n_sig, n_over)``: `keep` is `pad_to` flat indices ASCENDING (strips run in row
     order and `nonzero` returns ascending, so the concatenation is already lexsorted — the old
@@ -88,16 +85,24 @@ def _scan_flat_indices(q, M, eps, pad_to, row_chunk, unique):
 
 
 def _decode_flat(keep, M, pad_to, n_sig, unique):
-    """``(pi, pj, valid)`` from ascending flat indices, padded to ``pad_to`` with dummy (0,0)."""
-    k = min(int(n_sig), int(pad_to))
-    live = keep[:k]
-    pi, pj = (live // M).astype(jnp.int32), (live % M).astype(jnp.int32)
+    """``(pi, pj, valid)`` from ascending flat indices, padded to ``pad_to`` with dummy (0,0). The
+    count is traced, so a refresh with a new count compiles nothing."""
+    return _decode_fixed(keep, M, int(pad_to), jnp.asarray(min(int(n_sig), int(pad_to)), jnp.int64),
+                         bool(unique))
+
+
+@functools.partial(jax.jit, static_argnums=(1, 2, 4))
+def _decode_fixed(keep, M, pad_to, k, unique):
+    flat = keep[:pad_to]
+    live = jnp.arange(pad_to) < k
+    pi = jnp.where(live, flat // M, 0).astype(jnp.int32)
+    pj = jnp.where(live, flat % M, 0).astype(jnp.int32)
     valid = _pair_weights(pi, pj, unique)
-    if pad_to > k:
-        z = jnp.zeros(pad_to - k, jnp.int32)
-        pi, pj = jnp.concatenate([pi, z]), jnp.concatenate([pj, z])
-        valid = jnp.concatenate([valid, jnp.zeros(pad_to - k, valid.dtype)])
-    return pi, pj, valid
+    return pi, pj, jnp.where(live, valid, jnp.zeros((), valid.dtype))
+
+
+class PairPadOverflow(ValueError):
+    """More significant pairs than the pad frozen for the run."""
 
 
 @functools.partial(jax.jit, static_argnums=(1, 3, 4))
@@ -116,52 +121,6 @@ def _count_significant(q, M, eps, row_chunk, unique):
 
     tot, _ = lax.scan(body, jnp.int64(0), starts)
     return tot
-
-
-@functools.partial(jax.jit, static_argnums=(1, 3, 4, 5))
-def _scan_flat_and_vals(q, M, eps, cap, row_chunk, unique):
-    """Flat indices AND their |S| values, into a buffer of STATIC size ``cap``.
-
-    The overflow path's input. Collecting values is what makes "keep the largest" a real sort rather
-    than an approximation, and pinning the buffer to `cap` (a multiple of the pad, itself frozen for
-    the run) is what keeps the shape static — a buffer sized to the live count would vary between
-    refreshes, and a mid-run recompile tears down the multi-GPU graphs and deadlocks the collective
-    teardown. Entries past the live count are (-1, -inf), so they sort last.
-    """
-    n_strips = -(-M // row_chunk)
-    starts = jnp.arange(n_strips, dtype=jnp.int64) * row_chunk
-    ck = row_chunk * M
-
-    def body(carry, a):
-        out, val, off = carry
-        sv = _strip_abs_overlap(q, a, row_chunk, M)
-        rows = jnp.arange(ck) // M + a
-        sig = (sv > eps) & (rows < M)
-        if unique:
-            sig = sig & (jnp.arange(ck) % M >= rows)
-        cnt = jnp.sum(sig)
-        loc = jnp.nonzero(sig, size=ck, fill_value=0)[0].astype(jnp.int64)
-        live = jnp.arange(ck) < cnt
-        out = lax.dynamic_update_slice(out, jnp.where(live, loc + a * M, jnp.int64(-1)), (off,))
-        val = lax.dynamic_update_slice(val, jnp.where(live, jnp.take(sv, loc), -jnp.inf), (off,))
-        return (out, val, off + cnt), None
-
-    buf = jnp.full(cap + ck, jnp.int64(-1), jnp.int64)
-    vbuf = jnp.full(cap + ck, -jnp.inf, jnp.float64)
-    (out, val, _o), _ = lax.scan(body, (buf, vbuf, jnp.int64(0)), starts)
-    return out[:cap], val[:cap]
-
-
-def _keep_largest(q, M, eps, n_sig, pad_to, row_chunk, unique, headroom=2):
-    """The ``pad_to`` largest-overlap pairs when the significant count overruns the pad."""
-    cap = int(headroom) * int(pad_to)
-    if n_sig > cap:
-        raise ValueError(
-            f"neighbor_pairs: {n_sig} significant pairs exceed {headroom}x the pad ({cap}). "
-            f"Raise screen.pad — the run's pair list has outgrown the shape frozen at step 0.")
-    flat, vals = _scan_flat_and_vals(q, M, float(eps), cap, int(row_chunk), bool(unique))
-    order = jnp.argsort(-vals)[:pad_to]          # dead entries carry -inf and sort last
-    return jnp.sort(flat[order])
 
 
 def _spatial_candidates(splats, eps, unique, safety=1.25):
@@ -237,9 +196,8 @@ def neighbor_pairs(splats, eps: float = 1e-5, pad_to: int | None = None, row_chu
     keeps a static shape under ``jit``; without it, ``pad_to`` is taken from the exact significant
     count.
 
-    Overflow is not an error: if the significant count exceeds ``pad_to``, the ``pad_to``
-    largest-|overlap| pairs are kept. The trainer needs constant shapes for a whole run — a mid-run
-    recompile tears down the multi-GPU CUDA graphs and deadlocks the collective teardown.
+    Overflow raises :class:`PairPadOverflow`: the trainer needs constant shapes for a whole run (a
+    mid-run recompile deadlocks a mesh), and dropping pairs would change the energy silently.
 
     O(M²) work, but O(row_chunk·M + n_sig) resident: row strips are filtered as they are produced
     and never assembled into the full table.
@@ -308,18 +266,25 @@ def neighbor_pairs(splats, eps: float = 1e-5, pad_to: int | None = None, row_chu
             f"neighbor_pairs: {n_over} strip(s) overran the per-strip capacity. This is a bug in the "
             f"capacity heuristic, not a user error — report the system and pad ({pad_to}).")
     if n_sig > pad_to:
-        print(f"  [screening] pair count {n_sig} > pad {pad_to}: keeping the {pad_to} "
-              f"largest-overlap pairs (dropped {n_sig - pad_to})", flush=True)
-        keep = _keep_largest(q, M, float(eps), n_sig, int(pad_to), int(row_chunk), bool(unique))
-        return _decode_flat(keep, M, int(pad_to), int(pad_to), unique)
+        raise PairPadOverflow(
+            f"neighbor_pairs: {n_sig} significant pairs overflow the pad of {pad_to} (eps={eps:g}, "
+            f"unique={bool(unique)}); raise pairlist(pad=...)")
     return _decode_flat(keep, M, int(pad_to), n_sig, unique)
+
+
+def count_pairs(splats, eps: float = 1e-5, row_chunk: int = 256, unique: bool = False) -> int:
+    """How many pairs :func:`neighbor_pairs` would list — one compiled scan, one host sync."""
+    M = int(splats.centers.shape[0])
+    if eps < 0.0:
+        return M * (M + 1) // 2 if unique else M * M
+    return int(_count_significant(full_quantities(splats), M, float(eps), int(row_chunk), bool(unique)))
 
 
 def _pair_weights(pi, pj, unique):
     """Third output of :func:`neighbor_pairs`: a bool mask, or the (2 − δ_ij) weights when unique."""
     if not unique:
         return jnp.ones(pi.shape[0], bool)
-    return jnp.where(pi == pj, 1.0, 2.0)
+    return jnp.where(pi == pj, 1.0, 2.0).astype(jnp.float64)    # strong-typed: a fixed step signature
 
 
 def pair_weight(valid, dtype=jnp.float64):
@@ -345,29 +310,118 @@ def _full_overlap_pairs(q, pi, pj):
     return NK * jnp.pi ** 1.5 / jnp.sqrt(det3(Aij))
 
 
-def _full_nuclear_pairs(q, pi, pj, atom_coords, atom_charges):
-    """Per-pair version of ``dense.nuclear_attraction_matrix`` — Laplace quadrature with
-    B = A_ij + t²I. Degeneracy-safe (no eigh). The bra-pair g_i g_j is screened by the SAME overlap
-    list, but each surviving pair still sums over ALL nuclei — V_ne's long-range 1/r tail does not
-    vanish with nuclear distance, so dropping far nuclei would need multipoles (a later refinement).
+def _nuclear_geometry(q, Ci, Cj, occ, atom_coords, ci, cj, cv):
+    """Per-pair pieces of V_ne in each pair's eigenframe (Â_ij = UΛUᵀ): Λ (P,3), the squared
+    rotated nucleus–centre offsets x = (Uᵀ(R_A − μ_ij))² (n_atoms,P,3), and h = w·P_ij·N_iN_jK_ij (P,).
+    Takes the chunk's coefficient rows ``Ci = C[ci]``, ``Cj = C[cj]``, so the reverse adds their
+    cotangents into its running total in place."""
+    Aij, mup, NK = _full_pair_quantities(q, ci, cj)
+    Lam, U = jnp.linalg.eigh(Aij)
+    d = atom_coords[:, None, :] - mup[None, :, :]                 # (n_atoms, P, 3)
+    x = jnp.einsum("pki,apk->api", U, d) ** 2
+    h = pair_weight(cv, Ci.dtype) * jnp.sum(occ[None, :] * Ci * Cj, axis=1) * NK
+    return Lam, x, h
 
-    Node loop = static python unroll in a division-lean form (as in
-    ``coulomb.ri.full_isobra_block``): the exponent uses ``A_ij B⁻¹ = I − t²B⁻¹`` →
-    expo = t²|d|² − t⁴ (d·adj(B)d)/det(B), so each node costs one reciprocal per pair
-    (adjugate = mults) and the whole loop fuses into one kernel."""
-    Aij, mup, NK = _full_pair_quantities(q, pi, pj)
-    d = mup[:, None, :] - atom_coords[None, :, :]             # (P, n_atoms, 3)
-    d2 = jnp.sum(d * d, axis=-1)                              # (P, n_atoms)
-    vA = jnp.zeros(d2.shape)
-    for t, w in zip(_QUAD_T_LIST, _QUAD_W_LIST):              # static unroll → one fused kernel
+
+def _nuclear_nodes(Lam, x, grad):
+    """V[A,p] = Σ_t w (∏_k Γ_k)^{-1/2} exp(−Σ_k c_k x_k), Γ_k = Λ_k + t², c_k = t²Λ_k/Γ_k — the
+    point-charge limit of the (iso aux | pair) kernel. Γ, c are per pair and node; only the exp is
+    per nucleus. With ``grad`` also the node sums X_k = Σ I c_k (∂V/∂x_k = −X_k) and
+    Y_k = Σ I (−½/Γ_k − t⁴ x_k/Γ_k²) (= ∂V/∂Λ_k). Division-free (1/Γ_k = Γ_iΓ_j/∏Γ)."""
+    L = [Lam[None, :, k] for k in range(3)]                       # (1,P)
+    xs = [x[..., k] for k in range(3)]                            # (n_atoms,P)
+    V = 0.0
+    X, Y = [0.0] * 3, [0.0] * 3
+    for t, w in zip(_QUAD_T_LIST, _QUAD_W_LIST):                  # static unroll → one fused kernel
         t2 = t * t
-        B = Aij + t2 * _I3                                    # (P,3,3)
-        invdet = 1.0 / det3(B)                                # ONE reciprocal per pair
-        qf = jnp.einsum("pak,pkl,pal->pa", d, adj3(B), d)     # d·adj(B)·d  (P, n_atoms)
-        expo = t2 * d2 - (t2 * t2) * qf * invdet[:, None]
-        vA = vA + (w * jnp.pi ** 1.5) * jnp.sqrt(invdet)[:, None] * jnp.exp(-expo)
-    vA = (2.0 / jnp.sqrt(jnp.pi)) * vA                        # (P, n_atoms)
-    return -jnp.sum(atom_charges[None, :] * vA, axis=1) * NK
+        G = [Lk + t2 for Lk in L]
+        r = lax.rsqrt(G[0] * G[1] * G[2])
+        r2 = r * r
+        iG = (G[1] * G[2] * r2, G[0] * G[2] * r2, G[0] * G[1] * r2)
+        c = [t2 * L[k] * iG[k] for k in range(3)]
+        I = (w * r) * jnp.exp(-(c[0] * xs[0] + c[1] * xs[1] + c[2] * xs[2]))
+        V = V + I
+        if grad:
+            for k in range(3):
+                X[k] = X[k] + I * c[k]
+                Y[k] = Y[k] + I * (-0.5 * iG[k] - (t2 * iG[k]) ** 2 * xs[k])
+    if not grad:
+        return V
+    V, X, Y = lax.optimization_barrier((V, X, Y))     # one node loop, not one per consumer
+    return V, jnp.stack(X, -1), jnp.stack(Y, -1)
+
+
+_NE_PREF = 2.0 * np.pi       # (2/√π)·π^{3/2}
+
+
+def _external_chunk(q, C_orth, occ, atom_coords, atom_charges, ci, cj, cv):
+    Lam, x, h = _nuclear_geometry(q, C_orth[ci], C_orth[cj], occ, atom_coords, ci, cj, cv)
+    V = _nuclear_nodes(Lam, x, grad=False)
+    return -_NE_PREF * jnp.sum(h * (atom_charges @ V))
+
+
+def _external_live(fn, zero, cv, skip_pad):
+    """``fn()`` on a chunk, or ``zero`` for an all-padding chunk when ``skip_pad`` (the pad is
+    appended). Never differentiated through (the stream carries its own VJP), so the cond is free."""
+    if skip_pad:
+        return lax.cond(jnp.any(cv != 0), fn, lambda: zero)
+    return fn()
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(8, 9))
+def _external_stream(q, C_orth, occ, atom_coords, atom_charges, pi, pj, valid, chunk, skip_pad):
+    """E_ext = Σ_p w_p P_p V_p over the pair list, streamed in chunks. Its reverse is made in the
+    forward, in the same pass (E_ext is a scalar): no tape, no remat."""
+    pic, pjc, vc = _chunk_pairs(pi, pj, valid, chunk)
+
+    def body(acc, c):
+        ci, cj, cv = c
+        e = _external_live(lambda: _external_chunk(q, C_orth, occ, atom_coords, atom_charges,
+                                                   ci, cj, cv), jnp.zeros(()), cv, skip_pad)
+        return acc + e, None
+
+    return lax.scan(body, jnp.zeros(()), (pic, pjc, vc))[0]
+
+
+def _external_stream_fwd(q, C_orth, occ, atom_coords, atom_charges, pi, pj, valid, chunk, skip_pad):
+    pic, pjc, vc = _chunk_pairs(pi, pj, valid, chunk)
+    z = lambda x: jnp.zeros(jnp.shape(x), jnp.result_type(x))   # zeros_like would carry a mesh sharding into shard_map
+    zero = (jnp.zeros(()), jax.tree.map(z, (q, C_orth, occ, atom_coords)), z(atom_charges))
+
+    def chunk_grad(acc, ci, cj, cv):
+        (Lam, x, h), vjp = jax.vjp(
+            lambda q_, a_, b_, o_, R_: _nuclear_geometry(q_, a_, b_, o_, R_, ci, cj, cv),
+            q, C_orth[ci], C_orth[cj], occ, atom_coords)
+        V, X, Y = _nuclear_nodes(Lam, x, grad=True)
+        zV = atom_charges @ V                                     # (P,)
+        e = -_NE_PREF * jnp.sum(h * zV)
+        gV = (-_NE_PREF * atom_charges)[:, None] * h[None, :]     # ∂E/∂V (n_atoms,P)
+        d_Lam = jnp.einsum("ap,apk->pk", gV, Y)
+        d_x = -gV[..., None] * X
+        gq, gCi, gCj, go, gR = vjp((d_Lam, d_x, -_NE_PREF * zV))
+        a_e, (a_q, a_C, a_o, a_R), a_Z = acc
+        # the coefficient rows' cotangents go straight into the running total, in place
+        return (a_e + e, (jax.tree.map(jnp.add, a_q, gq), a_C.at[ci].add(gCi).at[cj].add(gCj),
+                          a_o + go, a_R + gR), a_Z - _NE_PREF * (V @ h))
+
+    def body(acc, c):
+        ci, cj, cv = c
+        if skip_pad:
+            return lax.cond(jnp.any(cv != 0), lambda a: chunk_grad(a, ci, cj, cv), lambda a: a,
+                            acc), None
+        return chunk_grad(acc, ci, cj, cv), None
+
+    (e, g, gZ), _ = lax.scan(body, zero, (pic, pjc, vc))
+    return e, (g, gZ)
+
+
+def _external_stream_bwd(chunk, skip_pad, res, ct):
+    (gq, gC, gocc, gR), gZ = res
+    s = lambda a: ct * a
+    return (jax.tree.map(s, gq), s(gC), s(gocc), s(gR), s(gZ), None, None, None)
+
+
+_external_stream.defvjp(_external_stream_fwd, _external_stream_bwd)
 
 
 def screened_overlap_pairs(splats, pi, pj):
@@ -376,8 +430,11 @@ def screened_overlap_pairs(splats, pi, pj):
 
 
 def screened_nuclear_pairs(splats, pi, pj, atom_coords, atom_charges):
-    """V_ij for the listed pairs — the nuclear-attraction pair kernel."""
-    return _full_nuclear_pairs(full_quantities(splats), pi, pj, atom_coords, atom_charges)
+    """V_ij for the listed pairs — the nuclear-attraction pair kernel (eigenframe, as the stream)."""
+    Aij, mup, NK = _full_pair_quantities(full_quantities(splats), pi, pj)
+    Lam, U = jnp.linalg.eigh(Aij)
+    x = jnp.einsum("pki,apk->api", U, atom_coords[:, None, :] - mup[None, :, :]) ** 2
+    return -_NE_PREF * NK * (atom_charges @ _nuclear_nodes(Lam, x, grad=False))
 
 
 def screened_overlap_matvec(splats, pi, pj, C, valid=None, chunk=8192):
@@ -406,35 +463,25 @@ def density_pairs(C_orth, occ, pi, pj):
     return jnp.sum(occ[None, :] * C_orth[pi] * C_orth[pj], axis=1)
 
 
+EXT_CHUNK = 8192
+"""Pairs a chunk of the V_ne stream on one device (a mesh splits it: ``ks.shard``)."""
+
+
 def screened_external_energy(splats, C_orth, occ, pi, pj, atom_coords, atom_charges,
-                             valid=None, chunk=8192, skip_pad=False):
-    """E_external = Σ P_ij V_ij over the significant pairs, **streamed** over the pair list in chunks
-    + remat. O(n_pair) compute, O(chunk·n_atoms) memory — the (n_pair, n_atoms) nuclear intermediate
-    never fully materializes (dense V_ne's (Q,M,M,3,3) OOMs at scale). Equals Tr(P·V_ne) when no pairs
-    are screened; the dense M×M V never forms.
+                             valid=None, chunk=EXT_CHUNK, skip_pad=False):
+    """E_external = Σ P_ij V_ij over the significant pairs, **streamed** over the pair list in chunks.
+    O(n_pair·n_atoms) compute, O(chunk·n_atoms) memory; the dense M×M V never forms. Each pair's
+    kernel runs in its eigenframe (the point-charge limit of the RI-J node kernel), and the gradient
+    in (splats, C, occ, R, Z) is made in the forward pass (one pass, no tape).
 
     Only V_ne (the external energy — a trace, no positivity requirement) is screened. The overlap S
     and kinetic T are ALWAYS built dense: pairwise-screening them tips the occupied Gram G=CᵀSC and the
     kinetic Gram Θ=CᵀTC indefinite ⇒ E_kin<0. So there is no screened one-electron KINETIC — the dense
     one-electron path is the only path.
+
+    Degeneracy: as ``coulomb.ri.full_isobra_block``, the gradient needs Â_ij off exact isotropy.
     """
-    q = full_quantities(splats)                               # once, outside the remat'd scan
-    pic, pjc, vc = _chunk_pairs(pi, pj, valid, chunk)
-
-    def chunk_energy(ci, cj, cv):
-        Pp = pair_weight(cv, C_orth.dtype) * density_pairs(C_orth, occ, ci, cj)   # (chunk,)
-        V = _full_nuclear_pairs(q, ci, cj, atom_coords, atom_charges)
-        return jnp.sum(Pp * V)
-
-    def body(acc, carry):
-        ci, cj, cv = carry
-        if skip_pad:
-            # The pad is appended, so trailing chunks are all-dummy: skip the kernel (static shape
-            # kept, differentiable; a `where` would evaluate both branches).
-            e = lax.cond(jnp.any(cv != 0), chunk_energy, lambda *_: jnp.array(0.0), ci, cj, cv)
-        else:
-            e = chunk_energy(ci, cj, cv)
-        return acc + e, None
-
-    Eext, _ = lax.scan(jax.checkpoint(body), jnp.array(0.0), (pic, pjc, vc))
-    return Eext
+    if valid is None:
+        valid = jnp.ones(pi.shape[0], bool)
+    return _external_stream(full_quantities(splats), C_orth, occ, atom_coords, atom_charges,
+                            pi, pj, valid, int(min(chunk, max(1, pi.shape[0]))), bool(skip_pad))

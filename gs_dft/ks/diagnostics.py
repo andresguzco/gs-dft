@@ -1,25 +1,19 @@
 """Reusable training diagnostics for splat optimization.
 
-``CollapseGuard`` detects the step at which an optimization run *diverges* — the energy or gradient
-goes non-finite (NaN/±Inf) — and serializes the **last-good ("before")** and **first-broken ("after")**
-trainable states to disk, plus a JSON of metadata, for surgical post-mortem.
+``CollapseGuard`` stops a run at the step where it *diverges*: the energy or gradient goes non-finite
+(NaN/±Inf), or the grid's electron count regresses after having been correct. It holds no state of
+the run: the run's periodic checkpoint is what to inspect after a stop.
 
-Non-finite is the only trip: a large but finite energy rise is never a collapse. Both things that
-cause one — the refresh discontinuity of the screened pair list / aux, and the self-resolving
-splat-collision spike — are benign, so halting on an energy jump only aborts runs that would have
-recovered.
-
-Design notes:
-- JAX arrays are immutable, so retaining the previous step's pytree as "last good" is **free** (a
-  reference, not a copy) — only one extra state is ever held.
-- Loop-agnostic: feed it ``check(step, state, energy)`` once per step (with ``energy = E(state)``) and a
-  ``save_fn(path_prefix, state, step)``; it owns the detection + the before/after dump.
+A large but finite energy rise is never a collapse. Both things that cause one — the refresh
+discontinuity of the screened pair list / aux, and the self-resolving splat-collision spike — are
+benign, so halting on an energy jump only aborts runs that would have recovered.
 """
-import json
 import math
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
+from jax import lax
 
 from gs_dft.coulomb import ri as _cdf
 from gs_dft.coulomb.stream import full_quantities
@@ -27,9 +21,10 @@ from gs_dft.integrals.dense import overlap_times
 from gs_dft.ks.orthonormalize import orthonormalize
 from gs_dft.ks.terms import ProductDFCoulomb, ScreenedProductDFCoulomb
 from gs_dft.screening.pairs import _full_overlap_pairs, screened_overlap_matvec
+from gs_dft.screening.grid import _full_eval_block
 
 __all__ = ["CollapseGuard", "lindep_metrics", "dense_gram_eig_ends",
-           "dense_gram_spectrum"]
+           "dense_gram_spectrum", "splat_grid_norms", "grid_norm_fields"]
 
 
 class CollapseGuard:
@@ -38,19 +33,16 @@ class CollapseGuard:
     # (~1.7e-5 settled), one decade below the multi-device corruption it exists to catch (~1.3e-2).
     NELEC_RTOL = 1e-3
 
-    def __init__(self, ckpt_base, save_fn, nelec_ref=None, nelec_rtol=None):
-        """``ckpt_base``: output path prefix — writes ``{ckpt_base}_before.*`` / ``{ckpt_base}_after.*``
-        (via ``save_fn``) and ``{ckpt_base}_collapse.json``. ``save_fn(path_prefix, state, step)``
-        serializes one state bundle. A step is a collapse iff its energy or gradient is non-finite
-        (NaN/±Inf) — the only true-divergence signal; a finite energy jump never trips it (see the
-        module docstring)."""
-        self.ckpt_base = ckpt_base
-        self.save_fn = save_fn
-        self.last_good = None        # (step, E, state) — state is a free pytree reference
+    def __init__(self, nelec_ref=None, nelec_rtol=None, nelec_tol=None):
+        """A step is a collapse iff its energy or gradient is non-finite (NaN/±Inf), or its electron
+        count regresses (see :meth:`_nelec_bad`); a finite energy jump never trips it (see the module
+        docstring). ``nelec_tol`` is the electron-count tolerance in electrons; without it,
+        ``nelec_rtol`` (default :attr:`NELEC_RTOL`) relative to ``nelec_ref``."""
         self.triggered = False
         self.nelec_ref = None if nelec_ref is None else float(nelec_ref)
         if nelec_rtol is not None:
             self.NELEC_RTOL = float(nelec_rtol)          # per-run override of the class default
+        self.nelec_tol = None if nelec_tol is None else float(nelec_tol)
         self.nelec_earned = False    # has the run ever integrated to nelec_ref within tol?
         self.reason = None
 
@@ -66,8 +58,9 @@ class CollapseGuard:
         """
         if self.nelec_ref is None or nelec is None or not math.isfinite(float(nelec)):
             return False
-        err = abs(float(nelec) - self.nelec_ref) / max(abs(self.nelec_ref), 1e-300)
-        if err <= self.NELEC_RTOL:
+        err = abs(float(nelec) - self.nelec_ref)
+        tol = self.nelec_tol if self.nelec_tol is not None else self.NELEC_RTOL * abs(self.nelec_ref)
+        if err <= tol:
             self.nelec_earned = True
             return False
         return self.nelec_earned
@@ -81,12 +74,9 @@ class CollapseGuard:
             return True
         return self._nelec_bad(nelec)
 
-    def check(self, step, state, energy, gnorm=None, nelec=None):
-        """Call once per step with the state whose energy is ``energy`` (energy == E(state)). On the
-        first detected collapse it saves the before/after pair + metadata and returns True (so the
-        caller can halt); otherwise it records ``state`` as the new last-good and returns False.
-        ``gnorm`` (optional) lets the guard also trip on a non-finite gradient; ``nelec`` (optional,
-        with ``nelec_ref=`` at construction) on a regressed electron count."""
+    def check(self, step, energy, gnorm=None, nelec=None):
+        """Call once per step. On the first collapse it records :attr:`reason` and returns True (the
+        caller halts); it keeps returning True after that."""
         if self.triggered:
             return True
         if self.is_collapse(step, energy, gnorm, nelec):
@@ -94,20 +84,7 @@ class CollapseGuard:
             self.reason = ("nelec" if (math.isfinite(float(energy))
                                        and (gnorm is None or math.isfinite(float(gnorm))))
                            else "nonfinite")
-            sane = self.last_good
-            if sane is not None:
-                self.save_fn(f"{self.ckpt_base}_before", sane[2], sane[0])
-            self.save_fn(f"{self.ckpt_base}_after", state, step)
-            meta = {"collapse_step": step, "E_after": float(energy), "reason": self.reason,
-                    "nelec_after": (None if nelec is None else float(nelec)),
-                    "nelec_ref": self.nelec_ref,
-                    "before_step": (sane[0] if sane else None),
-                    "E_before": (sane[1] if sane else None)}
-            with open(f"{self.ckpt_base}_collapse.json", "w") as fh:
-                json.dump(meta, fh, indent=2)
             return True
-        if math.isfinite(float(energy)):
-            self.last_good = (step, float(energy), state)
         return False
 
 
@@ -196,3 +173,47 @@ def lindep_metrics(ks, model, state=None, *, include_cond: bool = False) -> dict
         ev = jnp.linalg.eigvalsh(_cdf.aux_metric(state.aux))
         out["cond_V"] = float(ev[-1] / jnp.clip(ev[0], 1e-30))
     return out
+
+
+# ---------------------------------------------------------------------------
+# The XC-exploit diagnostic: each splat's norm on the training grid
+# ---------------------------------------------------------------------------
+
+SPLAT_NORM_PMIN = 1e-6
+"""Occupation P_mm below which a splat's grid norm is not reported (an empty splat moves no energy)."""
+
+
+@jax.jit
+def _grid_norms(q, pts, w):
+    def body(acc, x):
+        p, wc = x
+        g, _ = _full_eval_block(q, p)
+        return acc + wc @ (g * g), None
+    acc, _ = lax.scan(body, jnp.zeros(q[2].shape[0]), (pts, w))
+    return acc
+
+
+def splat_grid_norms(basis, grid_points, grid_weights, chunk: int = 4096):
+    """∫g_m² for every splat by the grid quadrature, (M,). Splats are unit-normalized, so a value far
+    from 1 is a splat the grid cannot integrate."""
+    n = grid_points.shape[0]
+    pad = (-n) % chunk
+    pts = jnp.concatenate([grid_points, jnp.zeros((pad, 3))]).reshape(-1, chunk, 3)
+    w = jnp.concatenate([grid_weights, jnp.zeros(pad)]).reshape(-1, chunk)
+    return _grid_norms(full_quantities(basis), pts, w)
+
+
+def grid_norm_fields(ks, model, *, pmin: float = SPLAT_NORM_PMIN) -> dict:
+    """The exploit diagnostic as RESULT fields, over the splats with P_mm ≥ ``pmin``: the largest and
+    smallest grid norm, how many exceed 1.1, and Σ_m P_mm |∫g_m² − 1| over all splats (electrons)."""
+    C = orthonormalize(model.C, model.C.T @ overlap_times(model.basis, model.C))
+    P_mm = jnp.sum(model.occupations[None, :] * C * C, axis=1)
+    norms = splat_grid_norms(model.basis, ks.grid_points, ks.grid_weights,
+                             chunk=ks.grid_chunk or 4096)
+    P_mm, norms = jax.device_get((P_mm, norms))
+    live = P_mm >= pmin
+    sel = norms[live]
+    return {"splat_norm_max": float(sel.max()) if sel.size else float("nan"),
+            "splat_norm_min": float(sel.min()) if sel.size else float("nan"),
+            "splat_norm_n_over": int((sel > 1.1).sum()),
+            "splat_norm_excess": float((P_mm * abs(norms - 1.0)).sum())}
