@@ -7,7 +7,17 @@ own limit, extrapolated with the same estimator from the splat rungs::
 
 Reads ``data/figures/fig3_observables.csv`` and ``fig3_gto_gradients.csv`` and writes
 ``observables.{png,pdf}``. The bottom row comes from the ``kind=obs_selfref`` rows written by
-``selfref.py``.
+``selfref.py``. ``main(floor_path=CC_FLOOR)`` adds a dashed floor to the density and force columns,
+PBE against CCSD at cc-pVQZ (``fig3_cc_floor.csv``, ``rb_post.py ccfloor``): below it, the
+representation error is smaller than the functional's. The paper's figure does not draw it.
+
+The same figure for the rebuttal systems (``--rebuttal``) reads ``data/rebuttal/fig3_observables.csv``
+and ``fig3_gto_gradients.csv`` and measures the splat ladders against their power-law limit (the
+rebuttal's estimator; the rungs are not matched to the Gaussian counts). It writes one figure,
+``observables_sizes``, of four rows: the three smallest systems (CBS, ISC), then the three
+largest, with one viridis colour per system by atom count::
+
+    TUEPLOTS=1 USETEX=1 uv run python -m experiments.shared.plot_observables --rebuttal
 """
 import os
 
@@ -23,15 +33,26 @@ from experiments.common.style import (apply as apply_style, PAPER_FIG_HEIGHT_IN,
                                        save_at_height)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXP2 = os.path.join(HERE, "..", "..", "data", "figures", "fig3_observables.csv")
+DATA = os.path.join(HERE, "..", "..", "data")
+EXP2 = os.path.join(DATA, "figures", "fig3_observables.csv")
+CC_FLOOR = os.path.join(DATA, "figures", "fig3_cc_floor.csv")
+RB_OBS = os.path.join(DATA, "rebuttal", "fig3_observables.csv")
+RB_GRADIENTS = os.path.join(DATA, "rebuttal", "fig3_gto_gradients.csv")
+RB_SYSTEMS = ("sf6", "cubane", "adenine_thymine", "porphine", "retinal", "cholesterol")
+RB_OUT = os.path.join(HERE, "..", "rebuttal", "figures", "observables_sizes")
 
-OURS, BASE, GRIDC = "#5b2d91", "#8c8c8c", "#e9e9e9"
+OURS, BASE, GRIDC, FLOOR = "#5b2d91", "#8c8c8c", "#e9e9e9", "#2a7f62"
 NOCC = {"water": 5, "ethanol": 13, "alanine_dipeptide": 39}
-MARK = {"water": "o", "ethanol": "^", "alanine_dipeptide": "s"}
+MARK = {"water": "o", "ethanol": "^", "alanine_dipeptide": "s", "sf6": "o", "cubane": "^",
+        "adenine_thymine": "s", "porphine": "D", "retinal": "v", "cholesterol": "p"}
 LABEL = {"water": r"\ce{H2O}", "ethanol": r"\ce{C2H5OH}",
-         "alanine_dipeptide": "Ala dipeptide"}
+         "alanine_dipeptide": "Ala dipeptide", "sf6": r"\ce{SF6}", "cubane": "Cubane",
+         "adenine_thymine": "A--T pair", "porphine": "Porphine", "retinal": "Retinal",
+         "cholesterol": "Cholesterol"}
 PLAIN_LABEL = {"water": r"H$_2$O", "ethanol": r"C$_2$H$_5$OH",
-               "alanine_dipeptide": "Ala dipeptide"}
+               "alanine_dipeptide": "Ala dipeptide", "sf6": r"SF$_6$", "cubane": "Cubane",
+               "adenine_thymine": "A–T pair", "porphine": "Porphine", "retinal": "Retinal",
+               "cholesterol": "Cholesterol"}
 
 XKEY, XLAB = "params", "Free parameters"
 
@@ -45,7 +66,9 @@ ROW_TAG = ["CBS", "ISC"]
 LINTHRESH = 0.1   # mHa/atom; symlog linear zone on the energy panels
 
 
-FIG_H = PAPER_FIG_HEIGHT_IN * 1.65   # two rows
+FIG_H = PAPER_FIG_HEIGHT_IN * 1.65   # two rows (Figure 3)
+SIZES_H = PAPER_FIG_HEIGHT_IN * 1.45  # one two-row block of observables_sizes
+STACK_H = 0.85                        # of the block height, per further two-row block (the legend is shared)
 HA_BOHR_TO_MEV_A = 51422.08     # (27.211386 eV/Ha) / (0.529177 A/Bohr), x1000
 
 
@@ -56,6 +79,19 @@ def _natoms(sysn):
     if sysn not in _NATOMS:
         _NATOMS[sysn] = len(systems.molecule(system=sysn, basis="cc-pvdz").symbols)
     return _NATOMS[sysn]
+
+
+def size_colors(names, hi=0.8):
+    """One viridis colour per system by atom count (the yellow end left out: it fades on white)."""
+    order = sorted(names, key=_natoms)
+    cm = matplotlib.colormaps["viridis"]
+    return {s: cm(hi * i / max(len(order) - 1, 1)) for i, s in enumerate(order)}
+
+
+def _nocc(sysn):
+    if sysn not in NOCC:
+        NOCC[sysn] = int(systems.molecule(system=sysn, basis="cc-pvdz").nelectron) // 2
+    return NOCC[sysn]
 
 
 def _unit(field, sysn):
@@ -94,12 +130,12 @@ def _basis_data(system, basis):
     return _BD[(system, basis)]
 
 
-def load(system):
+def load(system, csv=EXP2, grads=None):
     """(gto rows by basis, splat rows by M), each decorated with its resource coordinates."""
     gto, splat, ckpt_peak, obs_rows = {}, {}, {}, {}
-    if not os.path.exists(EXP2):
+    if not os.path.exists(csv):
         return gto, splat
-    for row in iter_results(EXP2):
+    for row in iter_results(csv):
         d = {k: v for k, v in row.items() if not k.startswith("_")}
         if d.get("system") != system:
             continue
@@ -110,7 +146,7 @@ def load(system):
             continue
         if d.get("kind") == "gto":
             d["params"] = resources.gto_params(_basis_data(system, d["basis"]),
-                                               int(d["nao"]), NOCC[system])["total"]
+                                               int(d["nao"]), _nocc(system))["total"]
             d["peak_mb"] = resources.peak_mb_from_row(d)
             gto.setdefault(d["basis"], {}).update(d)
         elif d.get("kind") == "gtol1":
@@ -118,7 +154,7 @@ def load(system):
         elif d.get("kind") == "obs":
             if (system, int(d["M"])) in STALE_RUNGS:
                 continue
-            d["params"] = resources.splat_params(int(d["M"]), NOCC[system])["total"]
+            d["params"] = resources.splat_params(int(d["M"]), _nocc(system))["total"]
             d["peak_mb"] = resources.peak_mb_from_row(d)
             obs_rows.setdefault(int(d["M"]), []).append(d)
         elif d.get("kind") == "gto_selfref":
@@ -144,10 +180,10 @@ def load(system):
     for M, d in splat.items():
         if d.get("peak_mb") is None and ckpt_peak.get(M) is not None:
             d["peak_mb"] = ckpt_peak[M]
-    for b, v in gto_dF(system).items():
+    for b, v in gto_dF(system, grads or GTO_GRADIENTS).items():
         if b in gto:
             gto[b]["dF_max"] = v
-    nelec = 2 * NOCC[system]
+    nelec = 2 * _nocc(system)
     for d in list(gto.values()) + list(splat.values()):
         for src, dst in (("L1_rho", "tv_e"), ("L1_rho_self", "tv_e_self")):
             l1 = _f(d, src)
@@ -172,13 +208,15 @@ GTO_GRADIENTS = os.path.join(HERE, "..", "..", "data", "figures", "fig3_gto_grad
 _ORDER = ["cc-pvdz", "cc-pvtz", "cc-pvqz", "cc-pv5z"]
 
 
-def gto_dF(system):
+def gto_dF(system, path=GTO_GRADIENTS):
     """``{basis: max|F_basis - F_ref|}`` for the Gaussian ladder -- the top row's force baseline.
 
     The reference is the largest rung with a finite gradient. The gradients are the ``grad`` arrays
     of the ``ref_*.npz`` files written by `exp2_observables/gto_ref.py` and `cc_ref.py`."""
     rows = {}
-    for r in read_records(GTO_GRADIENTS):
+    if not os.path.exists(path):
+        return {}
+    for r in read_records(path):
         if r["system"] == system:
             rows.setdefault(r["basis"], []).append([float(r[f"dE_d{a}"]) for a in "xyz"])
     grads = {b: np.asarray(g) for b, g in rows.items()}
@@ -212,6 +250,24 @@ def splat_limit(gto, splat):
     return cbs.extrapolate(byb), byb
 
 
+def splat_limit_powerlaw(splat):
+    """The rebuttal's splat limit: ``E(M) = E_inf + A M^-p`` over all the rungs (at least four)."""
+    Ms = sorted(M for M, s in splat.items() if _f(s, "E") == _f(s, "E"))
+    lim = cbs.fit_powerlaw(Ms, [_f(splat[M], "E") for M in Ms])
+    return dict(lim, kind=("cbs" if lim["kind"] == "fit" else "none")), {M: M for M in Ms}
+
+
+def floors(path=CC_FLOOR):
+    """``{system: (tv_e, dF)}`` of PBE against CCSD, in the columns' units (TV per electron, Ha/Bohr)."""
+    out = {}
+    if not path or not os.path.exists(path):
+        return out
+    for r in iter_results(path, kind="cc_floor"):
+        nelec = float(r["nelec"])
+        out[r["system"]] = (float(r["L1_rho"]) / (2.0 * nelec), abs(float(r["dF_max"])))
+    return out
+
+
 def _fmt_log(ax):
     ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10.0, subs=(1.0,), numticks=12))
     ax.yaxis.set_major_formatter(matplotlib.ticker.LogFormatterSciNotation(labelOnlyBase=True))
@@ -234,28 +290,42 @@ def _decorate(ax, xlab, usetex, pad=None):
     ax.yaxis.label.set_size(6.5)
 
 
-def main():
-    usetex = apply_style(nrows=2, ncols=len(COLS), rel_width=1.0, height_in=FIG_H)
+def main(names=("water", "ethanol", "alanine_dipeptide"), csv=EXP2, grads=GTO_GRADIENTS,
+         out=None, estimator="matched", floor_path=None, legend_ncol=None, colors=None,
+         groups=None, block_h=FIG_H):
+    # colors: {system: colour} draws each system in its own colour (splats solid, Gaussians dashed);
+    # None keeps the method colours of the paper's Figure 3.
+    # groups: tuples of systems, each drawn as its own two-row block (CBS, ISC) under the same
+    # columns, stacked top to bottom; None is one block of `names`.
+    groups = [tuple(names)] if groups is None else [tuple(g) for g in groups]
+    nr = 2 * len(groups)
+    fig_h = block_h * (1.0 + STACK_H * (len(groups) - 1))
+    usetex = apply_style(nrows=nr, ncols=len(COLS), rel_width=1.0, height_in=fig_h)
     lab = LABEL if usetex else PLAIN_LABEL
-    fig, axes = plt.subplots(2, len(COLS), squeeze=False)
+    fig, axes = plt.subplots(nr, len(COLS), squeeze=False)
     # The style bundle installs a layout engine, which ignores subplots_adjust and warns.
     _eng = fig.get_layout_engine()
     if _eng is not None:
         _eng.set(h_pad=0.02, w_pad=0.02, hspace=0.04, wspace=0.06)
+    # Each block shares x between its two rows; the density and force columns share y throughout.
     for c in range(len(COLS)):
-        if c > 0:
-            axes[1][c].sharey(axes[0][c])
-        axes[1][c].sharex(axes[0][c])
-        axes[0][c].tick_params(labelbottom=False)
+        for r in range(1, nr):
+            if c > 0:
+                axes[r][c].sharey(axes[0][c])
+            if r % 2:
+                axes[r][c].sharex(axes[r - 1][c])
+        for r in range(0, nr, 2):
+            axes[r][c].tick_params(labelbottom=False)
 
     present, notes, snotes, raw_rungs = [], {}, {}, []
-    for system in ("water", "ethanol", "alanine_dipeptide"):
-        gto, splat = load(system)
+    for system, r0 in [(s, 2 * b) for b, g in enumerate(groups) for s in g]:
+        gto, splat = load(system, csv, grads)
         if not splat:
             continue
         present.append(system)
         notes[system] = cbs.extrapolate({b: _f(g, "E") for b, g in gto.items()})
-        snotes[system], matched = splat_limit(gto, splat)
+        snotes[system], matched = (splat_limit_powerlaw(splat) if estimator == "powerlaw"
+                                   else splat_limit(gto, splat))
         raw_rungs += [f"{system} M={M}" for M, d in sorted(splat.items())
                       if d.get("ckpt") == "raw"]
         # The residual each row plots. Both ladders get both references: the bottom row is the
@@ -269,21 +339,37 @@ def main():
               f"{snotes[system]['kind']}"
               + (f" {snotes[system]['value']:.6f}" if snotes[system]["kind"] != "none" else "")
               + f"   gto CBS {notes[system]['value']:.6f}")
-        for rows, colour, ls, lw in ((list(gto.values()), BASE, "--", 1.0),
-                                     (list(splat.values()), OURS, "-", 1.3)):
+        for rows, gauss, ls, lw in ((list(gto.values()), True, "--", 1.0),
+                                    (list(splat.values()), False, "-", 1.3)):
+            colour = colors[system] if colors else (BASE if gauss else OURS)
+            alpha = 0.55 if colors and gauss else 1.0
             for r in range(2):
                 for j, (fields, _ylab, _sc) in enumerate(COLS):
                     xs, ys = _series(rows, fields[r])
                     if not xs:
                         continue
                     u = _unit(fields[r], system)
-                    axes[r][j].plot(xs, [y * u for y in ys], ls=ls, color=colour, lw=lw,
+                    axes[r0 + r][j].plot(xs, [y * u for y in ys], ls=ls, color=colour, lw=lw, alpha=alpha,
                                     zorder=3, marker=MARK[system], ms=2.8, mfc="white", mew=0.9)
 
-    for r in range(2):
+    # The functional's own error: PBE against CCSD at cc-pVQZ, in the density and force columns.
+    fl = {s: v for s, v in floors(floor_path).items() if s in present}
+    block = {s: 2 * b for b, g in enumerate(groups) for s in g}
+    edge = matplotlib.transforms.blended_transform_factory
+    for s, (tv, dF) in fl.items():
+        for r in (block[s], block[s] + 1):
+            for j, v in ((1, tv), (2, dF * HA_BOHR_TO_MEV_A)):
+                ax = axes[r][j]
+                ax.axhline(v, color=FLOOR, ls=(0, (4, 2)), lw=0.8, zorder=2)
+                ax.plot([0.96], [v], transform=edge(ax.transAxes, ax.transData), ls="none",
+                        color=FLOOR, marker=MARK[s], ms=2.8, mfc="white", mew=0.9, zorder=4,
+                        clip_on=False)
+        print(f"    {s:18s} CCSD floor: TV/e {tv:.3e}, dF {dF * HA_BOHR_TO_MEV_A:.1f} meV/A")
+
+    for r in range(nr):
         for j, (_fields, ylab, scale) in enumerate(COLS):
             ax = axes[r][j]
-            _decorate(ax, XLAB if r == 1 else "", usetex, pad=1.0 if r == 0 else None)
+            _decorate(ax, XLAB if r == nr - 1 else "", usetex, pad=1.0 if r % 2 == 0 else None)
             _v = [y for ln in ax.get_lines()
                   for y in np.asarray(ln.get_ydata(), dtype=float) if np.isfinite(y)]
             _p = [v for v in _v if v > 0]
@@ -308,12 +394,12 @@ def main():
                 ax.tick_params(axis="y", pad=7.5)
                 # Which reference this ROW uses, on the free right-hand edge: a title would have to
                 # repeat it in every panel and the panels are too narrow to carry it.
-                ax.text(1.04, 0.5, ROW_TAG[r], transform=ax.transAxes, rotation=270,
+                ax.text(1.04, 0.5, ROW_TAG[r % 2], transform=ax.transAxes, rotation=270,
                         va="center", ha="left", fontsize=6, color="#555555")
     for c, (_f2, _yl, scale) in enumerate(COLS):
         if c == 0:
             continue                    # set per panel above; the rows do not share a scale
-        _v = [y for r in range(2) for ln in axes[r][c].get_lines()
+        _v = [y for r in range(nr) for ln in axes[r][c].get_lines()
               for y in np.asarray(ln.get_ydata(), dtype=float)
               if np.isfinite(y) and (scale == "symlog" or y > 0)]
         if not _v:
@@ -323,27 +409,31 @@ def main():
         else:
             axes[0][c].set_ylim(min(_v) / 1.2, max(_v) * 1.6)
 
-    handles = [Line2D([], [], color=OURS, lw=1.3, label="Splats"),
-               Line2D([], [], color=BASE, lw=1.0, ls="--", label="cc-pV$X$Z")]
-    handles += [Line2D([], [], color="#444444", marker=MARK[s], ls="none", ms=2.8,
-                       mfc="white", mew=0.9, label=lab[s]) for s in present]
-    fig.legend(handles=handles, fontsize=6, frameon=False, ncol=len(handles),
+    ink = "#444444"
+    handles = [Line2D([], [], color=ink if colors else OURS, lw=1.3, label="Splats"),
+               Line2D([], [], color=ink if colors else BASE, lw=1.0, ls="--", label="cc-pV$X$Z")]
+    if fl:
+        handles.append(Line2D([], [], color=FLOOR, lw=0.8, ls=(0, (4, 2)), label="PBE vs CCSD"))
+    handles += [Line2D([], [], color=colors[s] if colors else ink, marker=MARK[s], ls="none",
+                       ms=2.8, mfc="white", mew=0.9, label=lab[s]) for s in present]
+    fig.legend(handles=handles, fontsize=6, frameon=False, ncol=legend_ncol or len(handles),
                loc="lower center", bbox_to_anchor=(0.5, 1.0), borderaxespad=0.0, handlelength=1.1,
                columnspacing=0.7, handletextpad=0.3)
 
-    out = os.path.join(HERE, "observables")
-    save_at_height(fig, out + ".png", height_in=FIG_H, dpi=240)
-    save_at_height(fig, out + ".pdf", height_in=FIG_H)
+    out = out or os.path.join(HERE, "observables")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    save_at_height(fig, out + ".png", height_in=fig_h, dpi=240)
+    save_at_height(fig, out + ".pdf", height_in=fig_h)
     w, h = fig.get_size_inches()
     print(f"wrote {out}.{{png,pdf}}  (usetex={usetex}, {w:.2f}x{h:.2f} in)")
     for s in present:
-        _g, sp = load(s)
+        _g, sp = load(s, csv, grads)
         n = {k: sum(1 for d in sp.values() if _f(d, k) == _f(d, k))
              for k in ("E", "tv_e", "tv_e_self", "dF_self")}
         print(f"    {s:18s} splat pts: {n['E']} E, {n['tv_e']} tv(gto), "
               f"{n['tv_e_self']} tv(self), {n['dF_self']} dF(self)")
     for s_ in present:
-        _g, sp = load(s_)
+        _g, sp = load(s_, csv, grads)
         fc = {round(float(d["frac_cbs"]), 4) for d in list(sp.values()) + list(_g.values())
               if d.get("frac_cbs") is not None}
         if fc:
@@ -354,4 +444,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--rebuttal" in sys.argv:
+        main(groups=(RB_SYSTEMS[:3], RB_SYSTEMS[3:]), csv=RB_OBS, grads=RB_GRADIENTS, out=RB_OUT,
+             estimator="powerlaw", floor_path=None, colors=size_colors(RB_SYSTEMS), block_h=SIZES_H)
+    else:
+        main()

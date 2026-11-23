@@ -22,7 +22,7 @@ from experiments.common.style import apply as apply_style, save_at_height
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.path.dirname(os.path.dirname(HERE)), "data", "rebuttal", "accuracy.csv")
 OUT = os.path.join(HERE, "figures", "spaghetti")
-FIG_H = 1.2          # inches, full text width: two panels with a legend row
+FIG_H = 1.39         # inches, full text width: two panels with a legend row (7.5% under Figure 7's height)
 BUDGET = 12000
 SYSTEMS = ("sf6", "cubane", "adenine_thymine", "retinal", "cholesterol", "chignolin", "cyclosporin")   # no porphine
 RAMP = plt.get_cmap("viridis")   # the scaling-law papers' map: small systems dark, large ones bright

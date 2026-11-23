@@ -28,6 +28,9 @@ figures:
 	printf '  %-26s' dissociation_ladder_both; \
 	MOL=both REL_WIDTH=1.0 $(ENV) $(PY) -m experiments.exp3_lih_dissociation.plot_energy_curve \
 	  >/dev/null 2>&1 || { echo 'FAILED'; exit 1; }; echo 'ok'; \
+	printf '  %-26s' observables_sizes; \
+	$(ENV) $(PY) -m experiments.shared.plot_observables --rebuttal >/dev/null 2>&1 \
+	  || { echo 'FAILED'; exit 1; }; echo 'ok'; \
 	printf '  %-26s' visual_abstract; \
 	$(ENV) $(PY) experiments/shared/visual_abstract.py >/dev/null 2>&1 \
 	  || { echo 'FAILED'; exit 1; }; echo 'ok'

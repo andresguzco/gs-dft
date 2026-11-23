@@ -15,6 +15,7 @@ all of them from these two folders alone.
 | `fig2_ablation.csv` | 2, Appendix E | the ablation runs: representation rungs, memory arms, sharded runs, eigensolve, optimizer, refresh and screening sweeps |
 | `fig3_observables.csv` | 3 | Gaussian and splat observables of water, ethanol and alanine dipeptide |
 | `fig3_gto_gradients.csv` | 3 | nuclear gradients (Ha/Bohr) of the Gaussian references |
+| `fig3_cc_floor.csv` | 3 | PBE against CCSD at cc-pVQZ for water and ethanol (`kind=cc_floor`: `L1_rho`, and `dF_max` in Ha/Bohr), the floor of the observables, not drawn in the figure (`plot_observables.main(floor_path=CC_FLOOR)` draws it) |
 | `fig4_anions.csv` | 4(a), Appendix F | fluoride and hydroxide, splats and the plain and augmented Gaussian ladders |
 | `fig4_dissociation.csv` | 4(b), Appendix F | LiH and LiF along the dissociation curve |
 | `fig5_isoparams.csv` | 5, 1 | the splat M-ladders and Gaussian baselines of water, ethanol and alanine dipeptide |
@@ -35,8 +36,8 @@ converts the logs of new runs to the same format.
 
 ## `rebuttal/`
 
-The accuracy scaling on the new systems (Figures 5 and 6, Appendix F) and the parallel efficiency
-(Appendix F). `accuracy.csv` is a run file in the format above.
+The accuracy scaling on the new systems (Figures 5 and 6, Appendix F), the parallel efficiency
+and the observables across system sizes (Appendix F). `accuracy.csv` is a run file in the format above.
 
 | File | Contents |
 |---|---|
@@ -45,6 +46,8 @@ The accuracy scaling on the new systems (Figures 5 and 6, Appendix F) and the pa
 | `exp2_scaling.csv` | step time (s; median, 10th and 90th percentiles) against the number of GPUs `G`, with repeats `rep` |
 | `exp2_memory.csv` | peak memory per GPU (MB, one value per GPU separated by `/`) against `G` |
 | `exp4.csv` | GPU4PySCF density fitting against direct SCF on cyclosporin A at cc-pVTZ |
+| `fig3_observables.csv` | the observables of Figure 3 on SF6, cubane, the A–T pair, porphine, retinal and cholesterol (Appendix F): splat rungs (`kind=obs`, forces `kind=forces`), Gaussian rungs (`kind=gto`, densities `kind=gtol1`; the cc-pV5Z rungs are density-fitted PySCF references, the density and force reference of the top row, with no `E`), and both against the splat limit (`kind=obs_selfref`, `gto_selfref`) |
+| `fig3_gto_gradients.csv` | nuclear gradients (Ha/Bohr) of their Gaussian references |
 
 ## `tables/`
 

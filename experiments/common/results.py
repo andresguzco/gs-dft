@@ -33,7 +33,8 @@ _KINDS = {"splat", "forces_corr", "gto", "gto_mem", "gto_min", "gtol1", "gto_for
           "obs", "forces", "resource", "opt",
           "cc", "mp2",
           # PBE (splat or GTO rung) differenced against the cc/mp2 archive: the Figure 3 error columns.
-          "gto_wf"}
+          "gto_wf",
+          "cc_floor"}      # PBE against CCSD at one basis: the floor of the density and force columns
 
 
 def _fmt(v):

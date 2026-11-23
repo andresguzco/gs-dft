@@ -23,6 +23,7 @@ paper, and matplotlib's mathtext otherwise. Each plotter writes its PDF next to 
 | Appendix F, dissociation ladders | `experiments.exp3_lih_dissociation.plot_energy_curve` (`MOL=both`) | `fig4_dissociation.csv` | `exp3_lih_dissociation/gen_gto_ladder.sh`, `gen_splat_matched.sh`, `run_warm.sh` |
 | Appendix F, accuracy scaling across sizes and its summary | `experiments.rebuttal.figures` (`spaghetti`, `accuracy_summary`) | `data/rebuttal/accuracy.csv` | as Figures 5 and 6 |
 | Appendix F, parallel efficiency | `experiments.rebuttal.figures` (`parallel_efficiency`) | `data/rebuttal/exp2_scaling.csv`, `exp2_memory.csv` | `experiments.rebuttal.scaling` (time), `experiments.bench.step` (memory) |
+| Appendix F, observables across system sizes | `experiments.shared.plot_observables --rebuttal` | `data/rebuttal/fig3_observables.csv`, `fig3_gto_gradients.csv` | `exp2_observables/rb_obs.py` (`polish`, then `obs`) on the ladders of `experiments.rebuttal.ladder`; Gaussian references by `gto_ref.py`, or `g4p_ref.py` on the grid of `obs_grid.py` (cc-pV5Z on the CPU with PySCF); `rb_post.py grads`; `selfref.py --estimator powerlaw` |
 
 `data/README.md` describes the columns. To plot new runs, convert their logs with
 `experiments.common.results.write_csv(logs, "data/figures/<file>.csv")`.

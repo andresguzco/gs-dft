@@ -1,0 +1,3 @@
+_source,_record,kind,system,basis,wf,L1_rho,L1_rho_vs_pbe_ccref,dF_max,nelec,n_grid
+ccfloor_ethanol.log,RESULT,cc_floor,ethanol,cc-pvqz,ccsd,0.24763099,0.24763099,0.01650782,26,272558
+ccfloor_water.log,RESULT,cc_floor,water,cc-pvqz,ccsd,0.07742401,0.07742401,0.01796804,10,91142

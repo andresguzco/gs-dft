@@ -29,7 +29,7 @@ from experiments.rebuttal import plot_spaghetti as sp
 OUT_DIR = os.path.join(sp.HERE, "figures")
 GTO_C, SPL_C = "#9a9a9a", "#5b2d91"     # the paper's method colours
 TARGET_MHA = 1.0
-FIG_H = 1.2                            # inches, one full-width row with a legend above
+FIG_H = 1.5                            # inches, one full-width row with a legend above (Figure 7's height)
 ORGANIC = {"H", "C", "N", "O"}
 
 

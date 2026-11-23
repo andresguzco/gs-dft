@@ -183,7 +183,7 @@ def memory_bars(path, out=None):
     save_at_height(fig, out + ".pdf", height_in=BAR_H / REL_W)
     print(f"wrote {out}")
 
-PE_H = 1.2            # inches, full text width: the time and memory panels side by side
+PE_H = 1.5            # inches, full text width: the time and memory panels side by side (Figure 7's height)
 PE_SHADES = dict(zip((2, 3, 4), SHADES[3]))   # one shade per G in both panels
 
 
